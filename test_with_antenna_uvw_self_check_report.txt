@@ -1,0 +1,2031 @@
+代码自检报告：test_with_antenna_uvw.py
+========================================
+
+一、报告对象
+------------
+
+本报告检查的文件是：
+
+    test_with_antenna_uvw.py
+
+这份代码的功能定位是：
+
+    读取多路 filterbank .fil 基带频域数据；
+    按天线和极化建立输入信号编号；
+    对实际存在的信号两两做相关计算；
+    将相关结果、时间轴、频率轴、天线信息、相位中心、极化信息、MS 行映射、UVW 信息写入一个 MS-ready HDF5 文件；
+    后续由 hdf5_to_ms.py 把这个 HDF5 转成 CASA MeasurementSet。
+
+本次自检只针对 test_with_antenna_uvw.py 本身，不直接检查 hdf5_to_ms.py。
+
+静态语法检查结果：
+
+    python3 -m py_compile /mnt/data/test_with_antenna_uvw.py
+
+结果：
+
+    通过，无 Python 语法错误。
+
+
+二、整体流程总览
+----------------
+
+程序入口是：
+
+    main()
+
+main() 的总流程是：
+
+    1. parse_command_line() 解析命令行参数。
+    2. check_file_count() 检查输入 .fil 文件数量。
+    3. parse_filename() 逐个解析文件名，得到日期、时间、天线编号、极化编号、输入信号编号。
+    4. check_time_consistency() 检查所有输入文件名中的时间标签一致。
+    5. check_duplicate_input_signal() 检查是否重复输入同一路信号。
+    6. print_input_signal_summary() 打印当前实际输入的天线、极化、信号编号。
+    7. parse_header() 逐个读取 .fil 文件头，得到 header 和 data_offset。
+    8. print_file() 和 print_header() 打印每个文件的关键信息和完整 header。
+    9. check_header_consistency() 检查 source_name、tstart、nbits 是否一致。
+    10. run_prepare_layer() 做相关计算前的准备。
+    11. run_correlation_and_save() 执行相关计算，并把结果写入 HDF5。
+
+主流程串起来以后，数据流是：
+
+    .fil 文件
+        -> 文件名解析
+        -> header 解析
+        -> 输入信号映射 signal_map
+        -> baseline_pairs 逻辑相关对
+        -> 按 block 读取复数频谱数据
+        -> Xi * conj(Xj) 相关计算
+        -> HDF5 /vis 数据集
+        -> HDF5 MS-ready 元数据组
+        -> 后续 hdf5_to_ms.py 转 MeasurementSet
+
+
+三、全局配置参数自检
+--------------------
+
+1. 输入文件数量
+
+    MAX_FILES = 20
+
+表示最多接收 20 个 .fil 文件。由于 N_PHYSICAL_ANTENNAS = 10，VALID_POLARIZATIONS = [0, 1]，所以 10 面天线 * 2 个极化 = 20 路输入信号。
+
+2. 天线编号范围
+
+    MIN_ANTENNA_ID = 0
+    MAX_ANTENNA_ID = 9
+
+文件名中的天线编号 xx 只能是 00 到 09。
+
+3. 极化编号
+
+    VALID_POLARIZATIONS = [0, 1]
+    POL0_NAME = "X"
+    POL1_NAME = "Y"
+
+P=0 表示 X，P=1 表示 Y。
+
+4. 频率和 FFT 参数
+
+    NCHAN = 2048
+    FFT_TIME_US = 4
+    CORR_TIME_US = 1000
+
+因此：
+
+    FFT_PER_CORR = CORR_TIME_US // FFT_TIME_US
+                 = 1000 // 4
+                 = 250
+
+每 250 个 FFT 积分成一个相关时间点。
+
+5. 每个 fil 文件理论 FFT 数
+
+    FFT_PER_INTEGRATION = 10
+    INTEGRATION_PER_FILE = 12500
+    FFT_PER_FILE = FFT_PER_INTEGRATION * INTEGRATION_PER_FILE
+                 = 10 * 12500
+                 = 125000
+
+因此每个 .fil 文件会被认为包含 125000 个 FFT。
+
+6. 每个 HDF5 时间点数量
+
+    n_corr_time = FFT_PER_FILE // FFT_PER_CORR
+                = 125000 // 250
+                = 500
+
+也就是输出 HDF5 的时间轴长度为 500。
+
+7. 每个 FFT 的字节数
+
+    BITS_PER_FREQ_POINT = 16
+    BYTES_PER_FREQ_POINT = 2
+    NCHAN = 2048
+
+因此：
+
+    BYTES_PER_FFT = NCHAN * BYTES_PER_FREQ_POINT
+                  = 2048 * 2
+                  = 4096 bytes
+
+代码假设每个频点是：
+
+    real int8 + imag int8
+
+这是一条很重要的硬编码假设。
+
+8. 相关输出模式
+
+    CORR_OUTPUT_MODE = "sum"
+
+表示每 250 个 FFT 的相关结果是求和，不是平均。
+
+如果需要平均相关值，应设置：
+
+    CORR_OUTPUT_MODE = "mean"
+
+当前代码会在 HDF5 attrs 中记录 corr_output_mode 和 corr_normalization_factor。
+
+
+四、第一阶段：基础 IO 和 header 解析
+------------------------------------
+
+相关函数：
+
+    open_binary_file(file_path)
+    read_int(f)
+    read_double(f)
+    read_string(f)
+    parse_header(file_path)
+
+1. open_binary_file(file_path)
+
+功能：
+
+    检查文件路径是否存在。
+    如果不存在，抛出 FileNotFoundError。
+    如果存在，用二进制方式 rb 打开。
+
+结果：
+
+    返回一个可读二进制文件对象。
+
+2. read_int(f)
+
+功能：
+
+    从当前位置读取 4 字节。
+    使用 struct.unpack("<i", data) 按 little-endian int32 解码。
+
+结果：
+
+    返回 Python int。
+
+自检：
+
+    这里假设 filterbank header 的 int 是小端序 int32。
+    如果输入文件不是这个格式，header 会解析失败。
+
+3. read_double(f)
+
+功能：
+
+    从当前位置读取 8 字节。
+    使用 struct.unpack("<d", data) 按 little-endian float64 解码。
+
+结果：
+
+    返回 Python float。
+
+自检：
+
+    这里假设 double 是小端序 float64。
+
+4. read_string(f)
+
+功能：
+
+    先调用 read_int(f) 读取字符串长度。
+    再读取 length 个字节。
+    用 UTF-8 解码。
+
+结果：
+
+    返回 Python str。
+
+自检：
+
+    如果字符串长度为负数，会报错。
+    如果实际读取字节数不足，会报 EOFError。
+
+5. parse_header(file_path)
+
+功能：
+
+    打开 .fil 文件。
+    第一个字符串必须是 HEADER_START。
+    然后循环读取 key。
+    遇到 HEADER_END 结束。
+    对于每个 key，根据 HEADER_VALUE_TYPES 字典判断值类型。
+    支持 string、int、double 三种类型。
+
+结果：
+
+    返回：
+
+        header: dict
+        data_offset: int
+
+其中 data_offset 是 HEADER_END 后的数据区起始位置。
+
+自检结论：
+
+    parse_header() 逻辑清楚，能严格发现未知 header key。
+    但它也比较刚性：如果 filterbank header 中出现 HEADER_VALUE_TYPES 未列出的合法 key，会直接报错。
+
+建议：
+
+    如果后续会遇到不同来源的 filterbank 文件，建议增加一个兼容模式：
+
+        对未知 key 给出 warning，而不是立即 fatal；
+        或者把 HEADER_VALUE_TYPES 做成用户可扩展配置。
+
+
+五、第二阶段：文件名解析和输入信号编号
+--------------------------------------
+
+相关函数：
+
+    calc_input_signal_no(antenna_id, polarization)
+    parse_filename(file_path)
+
+1. parse_filename(file_path)
+
+要求文件名格式：
+
+    YYYYMMDD_HHMMSS_xx_P.fil
+
+例子：
+
+    20260624_113210_01_0.fil
+
+解析结果包含：
+
+    date
+    time
+    time_tag
+    antenna_id
+    polarization
+    input_signal_no
+    input_signal_index
+
+2. calc_input_signal_no(antenna_id, polarization)
+
+当前编号规则：
+
+    P = 0:
+        input_signal_no = (antenna_id + 1) * 2 - 1
+
+    P = 1:
+        input_signal_no = (antenna_id + 1) * 2
+
+因此：
+
+    ant0 pol0 -> signal 1 -> index 0
+    ant0 pol1 -> signal 2 -> index 1
+    ant1 pol0 -> signal 3 -> index 2
+    ant1 pol1 -> signal 4 -> index 3
+    ...
+    ant9 pol1 -> signal 20 -> index 19
+
+结果：
+
+    20 路输入信号被映射到 Python 下标 0 到 19。
+
+自检结论：
+
+    该编号逻辑与 N_PHYSICAL_ANTENNAS=10、VALID_POLARIZATIONS=[0,1]、N_INPUT_SIGNALS=20 一致。
+
+潜在限制：
+
+    文件名格式被硬编码为 4 段：date_time_ant_pol。
+    如果未来文件名包含源名、阵列名或其它字段，需要修改 parse_filename()。
+
+
+六、第三阶段：输入一致性检查
+----------------------------
+
+相关函数：
+
+    check_file_count(files)
+    check_time_consistency(infos)
+    check_duplicate_input_signal(infos)
+    check_header_consistency(infos)
+    check_nchans(infos)
+    check_corr_config()
+
+1. check_file_count(files)
+
+功能：
+
+    检查输入文件数量不能为 0。
+    检查输入文件数量不能超过 MAX_FILES=20。
+
+结果：
+
+    防止没有输入或输入超过 20 路。
+
+2. check_time_consistency(infos)
+
+功能：
+
+    以第一个文件名中的 time_tag 为参考。
+    检查所有输入文件名中的 time_tag 是否一致。
+
+结果：
+
+    保证所有输入文件来自同一时间标签。
+
+3. check_duplicate_input_signal(infos)
+
+功能：
+
+    使用 input_signal_no 检查是否重复输入同一路信号。
+
+结果：
+
+    如果两个文件对应同一个 signal_no，会报错。
+
+4. check_header_consistency(infos)
+
+当前检查：
+
+    source_name 是否一致
+    tstart 是否一致
+    nbits 是否等于 REQUIRED_NBITS
+
+结果：
+
+    保证基本观测源、起始时间、位宽一致。
+
+自检发现：这里检查不够完整。
+
+建议增加检查：
+
+    fch1 是否一致
+    foff 是否一致
+    nchans 是否一致
+    tsamp 是否一致
+    nifs 是否一致
+    telescope_id / machine_id 是否一致，视需求决定
+
+原因：
+
+    如果两个 .fil 文件 source_name 和 tstart 一样，但是 fch1 或 foff 不同，当前代码仍可能继续相关计算。
+    这会导致不同频率通道的数据被错误地相乘。
+
+建议 Codex 后续增加函数：
+
+    check_header_numeric_consistency(infos, keys, tolerance)
+
+至少检查：
+
+    fch1
+    foff
+    tsamp
+    nchans
+
+5. check_nchans(infos)
+
+功能：
+
+    检查每个文件 header["nchans"] 是否等于代码里的 NCHAN=2048。
+
+结果：
+
+    防止频点数和代码读数据 reshape 不一致。
+
+6. check_corr_config()
+
+功能：
+
+    检查相关计算参数是否自洽。
+
+主要检查：
+
+    BITS_PER_FREQ_POINT 必须是 16。
+    BYTES_PER_FREQ_POINT 必须是 2。
+    CORR_TIME_US 必须能被 FFT_TIME_US 整除。
+    FFT_PER_FILE 必须能被 FFT_PER_CORR 整除。
+    READ_FFT_PER_BLOCK 必须能被 FFT_PER_CORR 整除。
+    CORR_OUTPUT_MODE 必须是 sum 或 mean。
+
+结果：
+
+    当前配置下：
+
+        FFT_PER_CORR = 250
+        FFT_PER_FILE = 125000
+        READ_FFT_PER_BLOCK = 36000
+
+    125000 能被 250 整除。
+    36000 能被 250 整除。
+
+自检结论：
+
+    这一部分设计合理。
+
+
+七、第四阶段：准备层 run_prepare_layer()
+----------------------------------------
+
+相关函数：
+
+    run_prepare_layer(infos)
+    add_data_info(infos)
+    check_n_fft_consistency(infos)
+    build_signal_file_map(infos)
+    check_antenna_info_for_inputs(signal_map)
+    get_baseline_pairs()
+
+run_prepare_layer() 的流程：
+
+    1. check_corr_config()
+    2. check_nchans(infos)
+    3. add_data_info(infos)
+    4. check_n_fft_consistency(infos)
+    5. build_signal_file_map(infos)
+    6. check_antenna_info_for_inputs(signal_map)
+    7. get_baseline_pairs()
+    8. 打印配置、信号映射、数据规模、baseline 信息、输出估计。
+
+1. add_data_info(infos)
+
+功能：
+
+    对每个输入文件，根据：
+
+        file_size
+        data_offset
+        bytes_per_fft
+
+    计算：
+
+        data_bytes = file_size - data_offset
+        n_fft = data_bytes // bytes_per_fft
+        n_integration = n_fft // FFT_PER_INTEGRATION
+
+结果：
+
+    每个 file_info 字典会增加：
+
+        file_size
+        data_bytes
+        n_fft
+        n_integration
+
+自检：
+
+    该函数严格要求 n_fft == FFT_PER_FILE。
+    如果实际文件较短或更长，会直接报错。
+
+2. build_signal_file_map(infos)
+
+功能：
+
+    建立长度为 N_INPUT_SIGNALS=20 的 signal_map。
+
+形式：
+
+    signal_map[index] = file_info 或 None
+
+如果某路信号没有输入文件，则为 None。
+
+结果：
+
+    后续相关计算只读取 signal_map 中实际存在的信号。
+
+3. get_baseline_pairs()
+
+功能：
+
+    对 20 路信号生成唯一相关对。
+    规则是 i <= j。
+
+数量：
+
+    N_INPUT_SIGNALS = 20
+    auto = 20
+    cross = 20 * 19 / 2 = 190
+    total = 210
+
+结果：
+
+    baseline_pairs 长度为 210。
+
+注意：
+
+    这里的 baseline 是“信号层面 baseline”，不是最终 MS 的物理天线 baseline。
+    信号层面 baseline 包含：
+
+        X-X
+        X-Y
+        Y-X
+        Y-Y
+        同一天线的 X/Y 自相关或互相关
+        不同天线之间的相关
+
+    后续 hdf5_to_ms.py 会把这些信号相关产品重新整理成物理 baseline + 极化产品。
+
+4. check_antenna_info_for_inputs(signal_map)
+
+功能：
+
+    如果用户提供了 --antenna-txt，则检查实际参与输入的天线是否都在天线 txt 中。
+
+重要自检发现：
+
+    如果 ANTENNA_INFO_TXT is None，该函数只打印：
+
+        [WARN] no antenna txt given, antenna positions will be placeholders
+
+    但是后续 validate_ms_ready_config(signal_map) 会因为 used antenna 使用 placeholder position 而报错。
+    同时 build_katpoint_antennas(signal_map) 也无法给实际使用天线构造 katpoint.Antenna。
+
+因此实际行为是：
+
+    对于当前 MS-ready HDF5 输出，--antenna-txt 实际上是必需的。
+
+建议修正：
+
+    在 MS-ready 模式下，如果 ANTENNA_INFO_TXT is None，应直接报错，而不是 warning。
+
+建议修改位置：
+
+    check_antenna_info_for_inputs(signal_map)
+
+建议逻辑：
+
+    if ANTENNA_INFO_TXT is None:
+        raise ValueError(
+            "--antenna-txt is required for MS-ready HDF5 because real antenna positions are needed for UVW"
+        )
+
+如果未来需要允许只做相关、不写 HDF5，可以根据 ENABLE_HDF5_OUTPUT 或一个新参数区分。
+
+
+八、第五阶段：读取数据和相关计算
+--------------------------------
+
+相关函数：
+
+    read_signal_block(file_info, block_start_fft, block_fft_count)
+    load_existing_signal_blocks(signal_map, block_start_fft, block_fft_count)
+    correlate_one_pair(x_i, x_j, fft_per_corr)
+    compute_correlation_block(data_cache, baseline_pairs, block_fft_count)
+
+1. read_signal_block()
+
+功能：
+
+    从某一路 .fil 文件读取一个 FFT block。
+
+读取位置：
+
+    offset = data_offset + block_start_fft * bytes_per_fft
+
+读取字节数：
+
+    read_bytes = block_fft_count * bytes_per_fft
+
+然后：
+
+    raw = np.frombuffer(data, dtype=np.int8)
+    raw.reshape(block_fft_count, NCHAN, BYTES_PER_FREQ_POINT)
+
+当前 BYTES_PER_FREQ_POINT = 2，因此最后一维是：
+
+    raw[:, :, 0] -> real int8
+    raw[:, :, 1] -> imag int8
+
+最后组成：
+
+    x = real + 1j * imag
+
+结果：
+
+    返回 shape = (block_fft_count, NCHAN) 的 complex64 数组。
+
+自检：
+
+    这个函数强依赖输入数据格式是：
+
+        每个频点 2 字节
+        第 1 字节 real int8
+        第 2 字节 imag int8
+
+    如果原始 filterbank 数据排列不是这个顺序，相关结果会错误。
+
+建议：
+
+    在 HDF5 attrs 中明确写入 raw_complex_layout = "int8 real, int8 imag"。
+    或者在命令行参数中允许指定数据布局。
+
+2. load_existing_signal_blocks()
+
+功能：
+
+    遍历 signal_map。
+    只读取实际存在的信号。
+    缺失信号不读取，也不创建零数组。
+
+结果：
+
+    返回 data_cache：
+
+        data_cache[signal_index] = complex array
+
+自检：
+
+    这个设计比较节省内存。
+
+3. correlate_one_pair()
+
+功能：
+
+    计算一对信号的相关。
+
+核心公式：
+
+    prod = x_i * conj(x_j)
+
+然后 reshape 为：
+
+    prod.reshape(n_corr_in_block, fft_per_corr, NCHAN)
+
+如果 CORR_OUTPUT_MODE == "sum"：
+
+    v = prod.sum(axis=1, dtype=np.complex64)
+
+如果 CORR_OUTPUT_MODE == "mean"：
+
+    v = prod.mean(axis=1, dtype=np.complex64)
+
+结果：
+
+    返回 shape = (n_corr_in_block, NCHAN) 的 complex64。
+
+科学含义：
+
+    对每个频率通道，每 250 个 FFT 做一次积分相关。
+
+自检：
+
+    公式 Xi * conj(Xj) 是合理的，但必须和后续 MS 转换的 baseline orientation 保持一致。
+    目前 HDF5 中 baseline_pairs 使用 i <= j。
+    后续 hdf5_to_ms.py 如果需要反向 signal pair，应取共轭。
+
+4. compute_correlation_block()
+
+功能：
+
+    对当前 block 中所有实际存在信号的 baseline_pairs 进行相关。
+
+逻辑：
+
+    for baseline_index, (i, j) in enumerate(baseline_pairs):
+        如果 i 不在 data_cache，跳过。
+        如果 j 不在 data_cache，跳过。
+        否则调用 correlate_one_pair(i, j)。
+
+结果：
+
+    返回 vis_dict：
+
+        key   = baseline_index
+        value = v, shape = (n_corr_in_block, NCHAN)
+
+没有计算的 baseline 不出现在 vis_dict 中。
+
+后续写 HDF5 时，缺失 baseline 保持 fillvalue = 0+0j。
+
+自检：
+
+    这个设计与 selected rows 逻辑一致。
+    但注意：HDF5 /vis 是完整 210 个 signal baseline 的逻辑数组，里面可能有大量 0。
+
+
+九、第六阶段：HDF5 时间轴和文件名
+---------------------------------
+
+相关函数：
+
+    mjd_to_unix_ns(mjd_value)
+    unix_ns_to_mjd(unix_ns)
+    unix_ns_to_filename_time(unix_ns)
+    unix_ns_to_iso_text(unix_ns)
+    get_hdf5_time_info(infos)
+    get_output_hdf5_file(infos)
+
+1. mjd_to_unix_ns()
+
+功能：
+
+    把 MJD 转成 Unix 纳秒。
+
+公式：
+
+    Unix epoch 对应 MJD 40587.0
+    unix_seconds = (mjd - 40587) * 86400
+    unix_ns = unix_seconds * 1e9
+
+使用 Decimal 避免浮点舍入误差。
+
+结果：
+
+    返回整数纳秒。
+
+2. get_hdf5_time_info()
+
+输入：
+
+    infos[0]["header"]["tstart"]
+
+计算：
+
+    start_mjd = tstart
+    n_corr_time = 500
+    duration_us = n_corr_time * CORR_TIME_US
+                = 500 * 1000 us
+                = 500000 us
+                = 0.5 s
+
+    end_unix_ns = start_unix_ns + duration_ns
+
+结果：
+
+    返回 start/end MJD、Unix ns、UTC 字符串、文件名时间字符串、持续时间等。
+
+3. get_output_hdf5_file()
+
+功能：
+
+    如果 OUTPUT_HDF5_FILE 不为 None，使用用户指定文件名。
+    否则根据 start/end 时间生成：
+
+        YYYYMMDDHHMMSSmmm_YYYYMMDDHHMMSSmmm.h5
+
+自检：
+
+    自动命名逻辑合理。
+    但 OUTPUT_HDF5_FILE 只能通过修改代码设置，命令行没有 --output 参数。
+
+建议：
+
+    增加命令行参数：
+
+        --output-h5
+        --overwrite / --no-overwrite
+        --compression
+
+这样不用每次改代码。
+
+
+十、第七阶段：天线坐标和阵列信息
+--------------------------------
+
+相关函数：
+
+    parse_antenna_name_to_id(name)
+    geodetic_to_itrf_m(lat_deg, lon_deg, alt_m)
+    deg_to_dms_str_for_katpoint(value_deg)
+    read_antenna_info_txt(file_path)
+    get_antenna_catalog()
+    get_used_antenna_ids(signal_map)
+    check_antenna_info_for_inputs(signal_map)
+    build_antenna_axis_metadata(signal_map)
+    build_katpoint_antennas(signal_map)
+
+1. read_antenna_info_txt()
+
+支持天线 txt 格式：
+
+    # name lat lon [alt_m] [diam_m]
+    ant0 29.784402 109.779625 1581 7.5
+
+处理流程：
+
+    跳过空行和 # 注释行。
+    每行至少 3 列：name lat lon。
+    第 4 列 alt_m 可选，默认 0。
+    第 5 列 diam_m 可选，默认 ANTENNA_DISH_DIAMETER_M。
+    调用 parse_antenna_name_to_id(name) 从名字解析 antenna_id。
+    检查经纬度范围。
+    调用 geodetic_to_itrf_m() 转成 ECEF/ITRF XYZ。
+
+结果：
+
+    返回 catalog：
+
+        catalog[antenna_id] = {
+            id,
+            name,
+            station,
+            lat_deg,
+            lon_deg,
+            alt_m,
+            diam_m,
+            position_itrf_m,
+            line_no,
+        }
+
+2. parse_antenna_name_to_id()
+
+当前要求：
+
+    天线名字必须以 ANTENNA_TXT_NAME_PREFIX 开头。
+    默认 ANTENNA_TXT_NAME_PREFIX = "ant"。
+
+允许：
+
+    ant0
+    ant9
+    ANT03
+
+不允许：
+
+    CARRY_1_ANT00
+    CARRY-ANT00
+
+自检发现：
+
+    如果你希望天线 txt 中直接写 CARRY_1_ANT00 这样的名字，当前代码会报错。
+
+建议：
+
+    短期保持天线 txt 名字为 ant0、ant1、...。
+    阵列名 CARRY_1 交给 hdf5_to_ms.py 写入 TELESCOPE_NAME / INSTRUMENT。
+
+    长期如果希望天线名也写成 CARRY_1_ANT00，建议改 parse_antenna_name_to_id()，支持正则：
+
+        ant0
+        ant00
+        ANT00
+        CARRY_1_ANT00
+
+    或者更稳妥地修改天线 txt 格式为：
+
+        id name lat lon alt_m diam_m
+        0 CARRY_1_ANT00 29.784402 109.779625 1581 7.5
+
+    这样不再依赖从 name 中解析数字。
+
+3. geodetic_to_itrf_m()
+
+功能：
+
+    使用 WGS84 椭球，把 lat/lon/alt 转成 ECEF XYZ。
+
+结果：
+
+    返回 shape=(3,) 的 float64 米单位坐标。
+
+自检：
+
+    公式标准，逻辑合理。
+
+4. build_antenna_axis_metadata()
+
+功能：
+
+    生成 HDF5 /antenna 分组需要的元数据。
+
+对于天线 txt 中存在的天线：
+
+    使用真实 name/station/lat/lon/alt/diam/position_itrf_m。
+
+对于天线 txt 中不存在的天线：
+
+    使用默认 name/station。
+    placeholder position 只给 x = antenna_id * 10.0，y=z=0。
+    position_is_placeholder_by_antenna = 1。
+
+结果：
+
+    返回 antenna_meta，包含：
+
+        id
+        name
+        station
+        latitude_deg
+        longitude_deg
+        altitude_m
+        position_itrf_m
+        dish_diameter_m
+        present_in_antenna_txt
+        used_in_input
+        position_is_placeholder_by_antenna
+        position_is_placeholder
+
+自检注意：
+
+    如果只输入两根天线，另外 8 根天线没有在 txt 里，则 position_is_placeholder 会是 1。
+    这不一定代表“实际使用的天线坐标有问题”。
+    它只是表示整个 10 天线轴里存在 placeholder。
+
+    后续 hdf5_to_ms.py 应该只检查 used antennas 是否有 placeholder。
+
+建议：
+
+    可以新增一个属性：
+
+        used_position_is_placeholder
+
+    只反映实际参与观测的天线是否有 placeholder。
+    这样比全局 position_is_placeholder 更不容易误解。
+
+5. build_katpoint_antennas()
+
+功能：
+
+    根据 antenna catalog 为每个物理天线构造 katpoint.Antenna。
+
+对于实际使用的天线：
+
+    如果天线 txt 缺失对应天线，直接报错。
+
+对于未使用天线：
+
+    允许 None。
+
+结果：
+
+    返回长度 N_PHYSICAL_ANTENNAS 的列表：
+
+        kat_antennas[local_index] = katpoint.Antenna 或 None
+
+自检：
+
+    逻辑合理。
+    它确保 UVW 不会基于 placeholder 坐标计算。
+
+
+十一、第八阶段：相位中心和 FIELD 信息
+-------------------------------------
+
+相关函数：
+
+    _split_angle_text(text)
+    parse_hms_to_rad(text)
+    parse_dms_to_rad(text)
+    get_field_phase_center()
+    build_katpoint_target()
+    write_field_group(h5, infos)
+
+1. parse_hms_to_rad()
+
+功能：
+
+    把 RA 字符串 HH:MM:SS.s 转成弧度。
+
+检查：
+
+    hour 范围 0 到 23。
+    minute 范围 0 到 59。
+    second 范围 0 到小于 60。
+
+结果：
+
+    返回 RA radians。
+
+2. parse_dms_to_rad()
+
+功能：
+
+    把 Dec 字符串 [+/-]DD:MM:SS.s 转成弧度。
+
+检查：
+
+    Dec 范围 -90 到 +90 度。
+
+结果：
+
+    返回 Dec radians。
+
+3. get_field_phase_center()
+
+功能：
+
+    如果 FIELD_RA_RAD 和 FIELD_DEC_RAD 不为 None，直接用它们。
+    否则解析 FIELD_RA_HMS 和 FIELD_DEC_DMS。
+
+当前配置：
+
+    FIELD_RA_HMS = "19:35:00.00"
+    FIELD_DEC_DMS = "21:54:00.00"
+    FIELD_FRAME = "J2000"
+
+结果：
+
+    返回 ra_rad、dec_rad、ra_deg、dec_deg、ra_hms、dec_dms、frame。
+
+4. build_katpoint_target()
+
+功能：
+
+    使用 FIELD_RA_HMS 和 FIELD_DEC_DMS 构造 katpoint.Target。
+
+结果：
+
+    后续 compute_uvw_for_ms_rows_with_katpoint() 用这个 target 算 UVW。
+
+自检发现：
+
+    write_field_group() 会把 source_name 从 header 中读取，但 phase center 使用代码配置 FIELD_RA_HMS / FIELD_DEC_DMS。
+    header 中的 src_raj / src_dej 只写入 attrs：
+
+        src_raj_header
+        src_dej_header
+
+    当前代码不会检查 header 中 src_raj/src_dej 是否和 FIELD_RA_HMS/FIELD_DEC_DMS 一致。
+
+风险：
+
+    如果用户忘记修改 FIELD_RA_HMS/FIELD_DEC_DMS，HDF5 的 FIELD/PHASE_DIR 和 UVW target 都会使用旧的默认值。
+    即使 header 中有正确源坐标，也不会自动使用。
+
+建议：
+
+    增加命令行参数：
+
+        --field-ra-hms
+        --field-dec-dms
+        --field-frame
+
+    或者增加严格检查：
+
+        如果 header[src_raj/src_dej] 存在，应与 FIELD_RA_HMS/FIELD_DEC_DMS 做一致性校验。
+
+    也可以新增 metadata：
+
+        phase_center_source = "command_line" 或 "code_config" 或 "filterbank_header"
+
+当前代码写的是：
+
+        phase_center_source = "code_config"
+
+这是诚实的，但需要用户明确知道。
+
+
+十二、第九阶段：MS-ready 行映射和极化信息
+-----------------------------------------
+
+相关函数：
+
+    signal_index_to_antenna_pol(signal_index)
+    get_corr_name(pol_i, pol_j)
+    build_selected_signal_baseline_indices(signal_map, baseline_pairs)
+    build_signal_axis_metadata(signal_map)
+    build_baseline_metadata(baseline_pairs)
+    build_ms_row_mapping(signal_map, baseline_pairs)
+    build_row_missing_signal_flags(signal_meta, baseline_meta, ms_row_map)
+    write_polarization_group(h5)
+    write_ms_rows_group(h5, ms_row_map, row_has_missing_signal)
+
+1. signal_index_to_antenna_pol()
+
+功能：
+
+    由 signal_index 反推 antenna_id 和 polarization_id。
+
+公式：
+
+    n_pol = len(VALID_POLARIZATIONS) = 2
+    antenna_id = MIN_ANTENNA_ID + signal_index // n_pol
+    polarization_id = signal_index % n_pol
+
+结果：
+
+    index 0 -> ant0 pol0
+    index 1 -> ant0 pol1
+    index 2 -> ant1 pol0
+    index 3 -> ant1 pol1
+
+自检：
+
+    与 calc_input_signal_no() 互相一致。
+
+2. get_corr_name(pol_i, pol_j)
+
+功能：
+
+    pol 0 -> X
+    pol 1 -> Y
+
+    组合得到：
+
+        XX
+        XY
+        YX
+        YY
+
+3. build_selected_signal_baseline_indices()
+
+功能：
+
+    从 210 个 baseline_pairs 中筛选“两个信号都实际存在”的 baseline。
+
+例如：
+
+    如果输入 ant0 X/Y 和 ant1 X/Y，一共 4 个信号存在。
+    selected_baseline_count = 4 * 5 / 2 = 10。
+
+注意：
+
+    这里选的是 signal-level baseline，不是 final MS physical baseline。
+
+4. build_signal_axis_metadata()
+
+功能：
+
+    生成 /signal 分组需要的元数据：
+
+        present
+        input_signal_no
+        antenna_id
+        polarization_id
+        file
+
+结果：
+
+    HDF5 可以明确知道每一路信号是否存在，以及对应哪个天线哪个极化。
+
+5. build_baseline_metadata()
+
+功能：
+
+    对 210 个 baseline_pairs 生成：
+
+        signal_pairs
+        antenna_pairs
+        polarization_pairs
+
+结果：
+
+    HDF5 能从 baseline index 反查 signal/antenna/pol 对应关系。
+
+6. build_ms_row_mapping()
+
+功能：
+
+    为 MS-ready HDF5 生成行级映射。
+
+步骤：
+
+    1. selected_signal_baseline_index 选出实际存在信号对应的 signal baseline。
+    2. 对每个 selected baseline，得到 signal_i/signal_j、antenna1/antenna2、pol_i/pol_j、corr_name。
+    3. 对每个 time index 重复上述 selected baselines。
+
+结果：
+
+    得到：
+
+        time_index
+        signal_baseline_index
+        signal_i
+        signal_j
+        antenna1
+        antenna2
+        pol_i
+        pol_j
+        corr_name
+        row_is_auto_signal
+        row_is_cross_signal
+        row_is_same_antenna
+        row_is_cross_antenna
+        selected_baseline_count
+        n_ms_rows
+
+数量关系：
+
+    n_ms_rows = n_corr_time * selected_baseline_count
+
+如果 4 个信号存在：
+
+    selected_baseline_count = 10
+    n_corr_time = 500
+    n_ms_rows = 5000
+
+后续 hdf5_to_ms.py 会进一步按物理天线 baseline 重新组织成：
+
+    Nblts = n_times * physical_baselines
+
+例如 2 根天线且不含 autos：
+
+    physical_baselines = 1
+    Nblts = 500
+
+自检结论：
+
+    该设计可以保留完整 signal-level HDF5 信息，同时方便后续重组为 MS。
+
+7. write_polarization_group()
+
+功能：
+
+    写入输入极化和全相关产品信息。
+
+写入：
+
+    input_pol_id = [0, 1]
+    input_pol_name = [X, Y]
+    all_corr_names = [XX, XY, YX, YY]
+    all_corr_pol_i = [0, 0, 1, 1]
+    all_corr_pol_j = [0, 1, 0, 1]
+
+自检：
+
+    这里顺序是 XX, XY, YX, YY。
+    hdf5_to_ms.py 内部还有自己的 POL_ORDER 和 MS_CORR_TYPES 处理，需要保持一致。
+
+
+十三、第十阶段：UVW 计算
+-----------------------
+
+相关函数：
+
+    build_center_time_seconds_for_katpoint(infos)
+    compute_uvw_for_ms_rows_with_katpoint(infos, signal_map, ms_row_map)
+    write_uvw_group(h5, infos, signal_map, ms_row_map)
+    validate_uvw_result(h5)
+
+1. build_center_time_seconds_for_katpoint()
+
+功能：
+
+    为每一个相关积分点生成中心时刻。
+
+公式：
+
+    interval_sec = CORR_TIME_US * 1e-6
+    interval_day = interval_sec / 86400
+    start_mjd0 = header["tstart"]
+    center_mjd = start_mjd0 + (index + 0.5) * interval_day
+    time_seconds = (center_mjd - 40587.0) * 86400.0
+
+结果：
+
+    返回 Unix seconds，shape=(n_corr_time,)。
+
+2. compute_uvw_for_ms_rows_with_katpoint()
+
+功能：
+
+    对每个 selected baseline slot 计算整条时间轴的 UVW。
+
+流程：
+
+    1. build_katpoint_antennas(signal_map) 得到 katpoint 天线对象。
+    2. build_katpoint_target() 得到相位中心 target。
+    3. build_center_time_seconds_for_katpoint() 得到时间轴。
+    4. 对每个 baseline_slot：
+        - 找到 antenna1、antenna2。
+        - 如果 antenna1 == antenna2，则 UVW = 0。
+        - 否则调用：
+
+              u, v, w = target.uvw(ant1, time_seconds_axis, ant2)
+
+        - 然后写入负号：
+
+              uvw_m[:, 0] = -u
+              uvw_m[:, 1] = -v
+              uvw_m[:, 2] = -w
+
+结果：
+
+    返回 uvw_m，shape=(n_ms_rows, 3)，单位米。
+
+重要自检结论：
+
+    当前版本已经加入 UVW 符号翻转：
+
+        uvw_m = -target.uvw(antenna1, time, antenna2)
+
+    这是为了匹配 pyuvdata/MS 对 ANTENNA1、ANTENNA2 的 UVW 约定。
+
+    这是正确修正，不要再在新 HDF5 转 MS 时额外使用 hdf5_to_ms.py 的 --flip-uvw-sign。
+
+3. write_uvw_group()
+
+功能：
+
+    写入 HDF5 /uvw 分组。
+
+写入：
+
+    uvw/uvw_m
+    uvw/is_placeholder = 0
+
+attrs 记录：
+
+    unit = m
+    method = katpoint.Target.uvw with sign flip for MS convention
+    target = radec FIELD_RA_HMS FIELD_DEC_DMS
+    katpoint_call = target.uvw(antenna1, time, antenna2)
+    sign_flip_applied = 1
+    uvw_convention = pyuvdata/MS ANTENNA1-ANTENNA2
+
+自检结论：
+
+    这部分现在记录得比较严谨，后续排查 UVW 符号时很有帮助。
+
+4. validate_uvw_result()
+
+功能：
+
+    检查：
+
+        uvw/uvw_m 是否存在。
+        shape 是否等于 (n_ms_rows, 3)。
+        uvw/is_placeholder 是否为 0。
+        同一天线行 UVW 是否接近 0。
+        跨天线行 UVW 是否不是全 0。
+
+结果：
+
+    能有效防止 UVW 缺失或全 0。
+
+建议增强：
+
+    当前只能检查“非零”和“auto 为零”，不能检查“几何方向正确”。
+    可以增加一个 debug 输出：
+
+        cross UVW min/max
+        max |UVW|
+        baseline 长度估计
+
+    这些目前 validate_ms_ready_output() 后面已经打印一部分 max |uvw|。
+
+
+十四、第十一阶段：HDF5 文件创建和写入
+-------------------------------------
+
+相关函数：
+
+    create_hdf5_file(output_file, infos, signal_map, baseline_pairs)
+    write_global_metadata(h5, infos, n_corr_time, n_baseline)
+    write_ms_ready_metadata(h5, infos, signal_map, baseline_pairs)
+    validate_ms_ready_output(h5)
+    write_correlation_block(h5, corr_start, corr_end, vis_dict)
+
+1. create_hdf5_file()
+
+功能：
+
+    创建 HDF5 文件。
+    创建 /vis 数据集。
+    写入根级 baseline_pairs。
+    写入旧版 signal metadata。
+    写入 global metadata attrs。
+    写入 MS-ready metadata groups。
+    运行 validate_ms_ready_output()。
+
+/vis 数据集形状：
+
+    shape = (n_corr_time, n_baseline, NCHAN)
+
+当前配置：
+
+    n_corr_time = 500
+    n_baseline = 210
+    NCHAN = 2048
+
+因此：
+
+    vis.shape = (500, 210, 2048)
+
+数据类型：
+
+    complex64
+
+chunks：
+
+    chunk_time = READ_FFT_PER_BLOCK // fft_per_corr
+               = 36000 // 250
+               = 144
+
+    chunks = (144, 1, 2048)
+
+fillvalue：
+
+    0+0j
+
+2. write_global_metadata()
+
+写入 HDF5 根属性，包括：
+
+    source_name
+    time_tag
+    tstart
+    data_start_mjd
+    data_end_mjd
+    data_start_unix_ns
+    data_end_unix_ns
+    data_start_utc
+    data_end_utc
+    fch1
+    foff
+    nchans
+    required_nbits
+    fft_time_us
+    corr_time_us
+    fft_per_corr
+    fft_per_file
+    read_fft_per_block
+    n_corr_time
+    n_baseline
+    output_dtype
+    corr_output_mode
+    corr_normalization_factor
+
+自检：
+
+    元数据记录比较完整。
+
+3. write_ms_ready_metadata()
+
+功能：
+
+    调用以下函数写 MS-ready HDF5 分组：
+
+        write_baseline_group()
+        write_signal_group()
+        write_time_group()
+        write_frequency_group()
+        write_antenna_group()
+        write_field_group()
+        write_polarization_group()
+        write_ms_rows_group()
+        write_uvw_group()
+        write_ms_defaults_group()
+
+结果：
+
+    HDF5 中得到这些分组：
+
+        /baseline
+        /signal
+        /time
+        /frequency
+        /antenna
+        /field
+        /polarization
+        /ms_rows
+        /uvw
+        /ms_defaults
+
+这些正是 hdf5_to_ms.py 后续需要读取的核心 schema。
+
+4. validate_ms_ready_output()
+
+功能：
+
+    检查 required_groups 是否存在。
+    检查 required_paths 是否存在。
+    检查不应该出现的 legacy root datasets。
+    检查 /vis shape。
+    检查 time/frequency/baseline/ms_rows 维度。
+    检查 selected_baseline_count 与 present signal 数量是否一致。
+    检查 row_has_missing_signal 是否全 False。
+    调用 validate_uvw_result() 检查 UVW。
+
+结果：
+
+    如果通过，说明 HDF5 schema 基本可供 hdf5_to_ms.py 使用。
+
+自检发现：
+
+    validate_ms_ready_output() 中有：
+
+        n_baseline = len(h5["baseline_pairs"])
+
+    这使用的是根级 legacy dataset /baseline_pairs。
+    但新的 MS-ready group 中已经有：
+
+        /baseline/signal_pairs
+
+    当前 create_hdf5_file() 同时创建了 root /baseline_pairs，所以不会报错。
+    但这会造成 schema 有两套 baseline_pairs，容易混淆。
+
+建议：
+
+    把 validate_ms_ready_output() 改成：
+
+        n_baseline = h5["baseline/signal_pairs"].shape[0]
+
+    并逐步移除 root /baseline_pairs，或者明确标记 root /baseline_pairs 是 legacy compatibility。
+
+5. write_correlation_block()
+
+功能：
+
+    把当前 block 的 vis_dict 写入 HDF5 /vis。
+
+逻辑：
+
+    for baseline_index, v in vis_dict.items():
+        vis[corr_start:corr_end, baseline_index, :] = v
+
+没有计算的 baseline 保持 fillvalue 0+0j。
+
+结果：
+
+    最终 HDF5 /vis 被按时间 block 填满。
+
+
+十五、第十二阶段：相关计算总调度 run_correlation_and_save()
+---------------------------------------------------------
+
+相关函数：
+
+    run_correlation_and_save(infos, signal_map, baseline_pairs)
+
+流程：
+
+    1. get_output_hdf5_file(infos) 生成输出 HDF5 文件名。
+    2. 如果 ENABLE_HDF5_OUTPUT=True：
+        - 调用 create_hdf5_file() 创建 HDF5。
+    3. 设置 n_corr_done = 0。
+    4. for block_start_fft in range(0, FFT_PER_FILE, READ_FFT_PER_BLOCK):
+        - 计算 block_fft_count。
+        - 检查 block_fft_count 可被 fft_per_corr 整除。
+        - 计算 n_corr_in_block。
+        - 计算 corr_start 和 corr_end。
+        - load_existing_signal_blocks() 读取实际存在信号。
+        - compute_correlation_block() 计算相关。
+        - write_correlation_block() 写入 HDF5。
+        - 更新 n_corr_done。
+    5. 结束后打印总 corr time。
+    6. 返回 output_file。
+
+当前配置：
+
+    FFT_PER_FILE = 125000
+    READ_FFT_PER_BLOCK = 36000
+
+block 划分为：
+
+    block 1: 0      -> 35999    = 36000 FFT = 144 corr
+    block 2: 36000  -> 71999    = 36000 FFT = 144 corr
+    block 3: 72000  -> 107999   = 36000 FFT = 144 corr
+    block 4: 108000 -> 124999   = 17000 FFT = 68 corr
+
+总相关时间点：
+
+    144 + 144 + 144 + 68 = 500
+
+自检结论：
+
+    block 设计与 500 个相关时间点完全匹配。
+
+性能建议：
+
+    当前 read_signal_block() 每个 block、每路信号都会重新 open 文件。
+    对少量文件问题不大。
+    如果未来 20 路、文件很大、block 很多，可以考虑预先打开文件句柄，减少 open/close 开销。
+
+
+十六、当前代码生成的 HDF5 结构总结
+----------------------------------
+
+根级：
+
+    /vis
+    /baseline_pairs       旧兼容数据集
+    /signal_present       旧兼容数据集
+    /signal_antenna_id    旧兼容数据集
+    /signal_polarization  旧兼容数据集
+    /input_signal_no      旧兼容数据集
+    /signal_files         旧兼容数据集
+    root attrs            全局元数据
+
+MS-ready 分组：
+
+    /baseline
+        signal_pairs
+        antenna_pairs
+        polarization_pairs
+
+    /signal
+        present
+        input_signal_no
+        antenna_id
+        polarization_id
+        file
+
+    /time
+        start_mjd
+        center_mjd
+        end_mjd
+        interval_sec
+        exposure_sec
+
+    /frequency
+        chan_freq_hz
+        chan_width_hz
+        ref_frequency_hz
+        nchan
+        attrs: input_unit, fch1_original, foff_original, channel_order
+
+    /antenna
+        id
+        name
+        station
+        latitude_deg
+        longitude_deg
+        altitude_m
+        position_itrf_m
+        dish_diameter_m
+        present_in_antenna_txt
+        used_in_input
+        position_is_placeholder_by_antenna
+        position_is_placeholder
+
+    /field
+        source_name
+        phase_center_ra_rad
+        phase_center_dec_rad
+        phase_center_ra_deg
+        phase_center_dec_deg
+        phase_center_ra_hms
+        phase_center_dec_dms
+        frame
+        is_placeholder
+
+    /polarization
+        input_pol_id
+        input_pol_name
+        ms_export_mode
+        all_corr_names
+        all_corr_pol_i
+        all_corr_pol_j
+        corr_type
+        corr_pol_i
+        corr_pol_j
+
+    /ms_rows
+        time_index
+        signal_baseline_index
+        signal_i
+        signal_j
+        antenna1
+        antenna2
+        pol_i
+        pol_j
+        corr_name
+        data_desc_id
+        field_id
+        scan_number
+        row_has_missing_signal
+        row_is_auto_signal
+        row_is_cross_signal
+        row_is_same_antenna
+        row_is_cross_antenna
+        attrs: selected_baseline_count, n_ms_rows, export_pol_mode
+
+    /uvw
+        uvw_m
+        is_placeholder
+        attrs: unit, method, target, sign_flip_applied, uvw_convention
+
+    /ms_defaults
+        flag_default
+        weight_default
+        sigma_default
+        missing_signal_should_flag
+
+
+十七、自检发现的问题与建议修正清单
+----------------------------------
+
+问题 1：--antenna-txt 实际必需，但当前只 warning
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+位置：
+
+    check_antenna_info_for_inputs(signal_map)
+
+现状：
+
+    如果 ANTENNA_INFO_TXT is None，只打印 warning。
+    但后续 MS-ready metadata 和 UVW 计算需要真实天线位置。
+
+风险：
+
+    用户可能以为没有 antenna txt 也能正常生成 MS-ready HDF5。
+
+建议：
+
+    在 ENABLE_HDF5_OUTPUT=True 且需要 UVW 时，缺少 antenna txt 应直接 raise ValueError。
+
+优先级：高。
+
+
+问题 2：header 一致性检查不够完整
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+位置：
+
+    check_header_consistency(infos)
+
+现状：
+
+    只检查 source_name、tstart、nbits。
+
+风险：
+
+    fch1、foff、tsamp 不一致的文件仍可能被相关。
+
+建议增加检查：
+
+    fch1
+    foff
+    tsamp
+    nchans
+    nifs
+
+优先级：高。
+
+
+问题 3：FIELD_RA_HMS / FIELD_DEC_DMS 与 header 坐标没有一致性检查
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+位置：
+
+    get_field_phase_center()
+    write_field_group()
+    build_katpoint_target()
+
+现状：
+
+    相位中心来自代码常量 FIELD_RA_HMS / FIELD_DEC_DMS。
+    header 中 src_raj / src_dej 只保存为 attrs，不参与计算。
+
+风险：
+
+    如果代码配置的相位中心与真实观测源不一致，UVW 和 FIELD/PHASE_DIR 都会错。
+
+建议：
+
+    增加命令行参数设置 RA/Dec。
+    或者读取 header src_raj/src_dej 并转换。
+    或者至少检查 header 与配置是否一致。
+
+优先级：高。
+
+
+问题 4：天线名称解析规则过窄
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+位置：
+
+    parse_antenna_name_to_id(name)
+
+现状：
+
+    只能解析 ant0、ant1、ANT03 这类名字。
+
+风险：
+
+    如果天线 txt 中写 CARRY_1_ANT00，会报错。
+
+建议：
+
+    短期继续用 ant0、ant1。
+    长期把天线 txt 改为显式 id/name 格式。
+
+优先级：中。
+
+
+问题 5：root /baseline_pairs 与 /baseline/signal_pairs 重复
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+位置：
+
+    create_hdf5_file()
+    validate_ms_ready_output()
+
+现状：
+
+    create_hdf5_file() 同时写 root /baseline_pairs 和 /baseline/signal_pairs。
+    validate_ms_ready_output() 使用 root /baseline_pairs 计算 n_baseline。
+
+风险：
+
+    schema 容易混淆。
+
+建议：
+
+    validate_ms_ready_output() 改用 /baseline/signal_pairs。
+    root /baseline_pairs 可以保留为 legacy，但建议标注或逐步移除。
+
+优先级：中。
+
+
+问题 6：position_is_placeholder 的语义容易误解
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+位置：
+
+    build_antenna_axis_metadata()
+
+现状：
+
+    只要 10 根天线里有任何一个 placeholder，position_is_placeholder 就是 1。
+
+风险：
+
+    如果实际只用了 ant0/ant1，且它们有真实坐标，但 ant2-ant9 没有坐标，group-level position_is_placeholder 仍是 1。
+    这可能让用户误以为实际使用天线坐标有问题。
+
+建议：
+
+    增加：
+
+        used_position_is_placeholder
+
+    专门表示 used_in_input 的天线是否有 placeholder。
+
+优先级：中。
+
+
+问题 7：异常处理缺少 traceback
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+位置：
+
+    main() except Exception as e
+
+现状：
+
+    只打印：
+
+        [ERROR]
+        error message
+
+    不打印 traceback。
+
+风险：
+
+    出错时很难定位具体函数和行号。
+
+建议：
+
+    import traceback
+    traceback.print_exc()
+
+优先级：中。
+
+
+问题 8：关键参数只能改代码，不能命令行指定
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+现状：
+
+    OUTPUT_HDF5_FILE
+    FIELD_RA_HMS
+    FIELD_DEC_DMS
+    CORR_OUTPUT_MODE
+    HDF5_COMPRESSION
+    READ_FFT_PER_BLOCK
+    OVERWRITE_OUTPUT
+
+都主要靠改代码。
+
+建议增加 argparse 参数：
+
+    --output-h5
+    --field-ra-hms
+    --field-dec-dms
+    --corr-output-mode sum/mean
+    --compression none/gzip
+    --read-fft-per-block
+    --overwrite
+
+优先级：中。
+
+
+问题 9：读取数据格式硬编码
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+位置：
+
+    read_signal_block()
+
+现状：
+
+    假设每个频点是 real int8 + imag int8。
+
+风险：
+
+    如果输入格式发生变化，相关结果会错。
+
+建议：
+
+    在配置和 HDF5 metadata 中明确写入 raw layout。
+    或者支持命令行参数指定数据布局。
+
+优先级：中。
+
+
+问题 10：CORR_OUTPUT_MODE=sum 可能导致幅度不是平均值
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+位置：
+
+    correlate_one_pair()
+
+现状：
+
+    默认对 250 个 FFT 求和。
+
+风险：
+
+    如果后续用户以为结果是平均相关值，会误解幅度尺度。
+
+建议：
+
+    在日志中更明确打印：
+
+        corr output mode = sum
+        integration FFT count = 250
+        values are accumulated, not averaged
+
+    或者默认改为 mean，视科学需求决定。
+
+优先级：低到中。
+
+
+十八、建议的 Codex 后续修改顺序
+--------------------------------
+
+建议按优先级分三步修改。
+
+第一步：修正高优先级科学一致性问题
+
+    1. check_header_consistency() 增加 fch1、foff、tsamp、nchans 检查。
+    2. 缺少 --antenna-txt 时，在 MS-ready 输出模式下直接报错。
+    3. 增加 FIELD_RA_HMS/FIELD_DEC_DMS 与 header 坐标的一致性检查，或增加命令行参数。
+
+第二步：改善可维护性
+
+    1. main() 异常处理增加 traceback。
+    2. validate_ms_ready_output() 改用 /baseline/signal_pairs。
+    3. 新增 used_position_is_placeholder。
+    4. summary 打印更明确的 HDF5 schema 和关键参数。
+
+第三步：增强易用性
+
+    1. 增加 --output-h5。
+    2. 增加 --corr-output-mode。
+    3. 增加 --field-ra-hms / --field-dec-dms。
+    4. 增加 --compression。
+    5. 支持更灵活的 antenna txt 格式。
+
+
+十九、整体自检结论
+------------------
+
+1. 代码整体流程是清楚的。
+
+    它从 .fil 文件读取 header 和频域复数数据，建立 20 路信号映射，对实际存在信号做 signal-level 相关，写入 HDF5 /vis，同时写入后续转 MS 所需的时间、频率、天线、field、polarization、ms_rows 和 UVW 元数据。
+
+2. 当前版本已经修复了 UVW 符号问题。
+
+    compute_uvw_for_ms_rows_with_katpoint() 中已经使用：
+
+        uvw_m = -target.uvw(antenna1, time, antenna2)
+
+    并在 HDF5 /uvw attrs 中记录 sign_flip_applied=1。
+
+    因此新 HDF5 后续转 MS 时不应再额外使用 --flip-uvw-sign。
+
+3. 当前代码最需要补强的是输入一致性检查。
+
+    尤其是：
+
+        fch1
+        foff
+        tsamp
+        FIELD_RA_HMS/FIELD_DEC_DMS 与 header 坐标
+        antenna txt 必需性
+
+4. 当前代码可以继续作为 HDF5 生成主流程使用。
+
+    但是建议在正式批量处理前，先完成上述高优先级修正，避免“代码能跑通，但科学元数据不一致”的隐患。
+
+5. 对用户当前 CASA 已能读取 MS 的结果而言，本代码的 HDF5 schema 已经基本满足 hdf5_to_ms.py 的需求。
+
+    后续重点不是重写整个流程，而是把关键参数检查、命令行参数、错误 traceback 和 metadata 语义进一步完善。

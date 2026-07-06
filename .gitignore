@@ -1,0 +1,6 @@
+*.fil
+*.FIL
+*.h5
+*.H5
+__pycache__/
+tmp_pip_probe/
