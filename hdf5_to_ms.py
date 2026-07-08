@@ -80,22 +80,23 @@ CASA_TELESCOPE_NAME = "CARRY_1"
 ARRAY_NAME = "CARRY_1"
 INSTRUMENT_NAME = "CARRY_1"
 
-POL_ORDER = ["XX", "YY", "XY", "YX"]
-POL_NUMS = np.array([-5, -6, -7, -8], dtype=np.int64)
-# CASA MeasurementSet CORR_TYPE uses CASA/Stokes enum values, not pyuvdata/AIPS
-# polarization numbers. For linear full-pol, pyuvdata writes CASA-standard order
-# XX, XY, YX, YY -> 9, 10, 11, 12.
-POL_AIPS2CASA_DICT = {
-    -8: 11,  # YX
-    -7: 10,  # XY
-    -6: 12,  # YY
-    -5: 9,   # XX
-}
-MS_CORR_ORDER_AIPS = np.array([-5, -7, -8, -6], dtype=np.int64)
-MS_CORR_TYPES = np.array(
-    [POL_AIPS2CASA_DICT[pol] for pol in MS_CORR_ORDER_AIPS],
-    dtype=np.int64,
-)
+# Keep the in-memory DATA polarization axis in the same order that
+# CASA MeasurementSet POLARIZATION/CORR_TYPE will advertise.
+#
+# CASA/Stokes enum:
+#   XX = 9
+#   XY = 10
+#   YX = 11
+#   YY = 12
+#
+# pyuvdata/AIPS polarization numbers:
+#   XX = -5
+#   XY = -7
+#   YX = -8
+#   YY = -6
+POL_ORDER = ["XX", "XY", "YX", "YY"]
+POL_NUMS = np.array([-5, -7, -8, -6], dtype=np.int64)
+MS_CORR_TYPES = np.array([9, 10, 11, 12], dtype=np.int64)
 REQUIRED_PATHS = [
     "vis",
     "baseline/signal_pairs",
@@ -562,7 +563,7 @@ def estimate_and_check_memory(
     if estimate["n_used_ant"] < 2 and not include_autos:
         raise ValueError(
             "no cross-antenna baselines to write: "
-            "need at least 2 used antennas, or use --include-autos"
+            "need at least 2 used antennas, or enable auto-correlations"
         )
 
     if estimate["n_phys_bl"] <= 0:
@@ -772,17 +773,23 @@ def build_data_flag_nsample(
     rows_with_any_data = 0
     rows_with_partial_pols = 0
     rows_dropped_all_missing = 0
+    rows_auto_candidate = 0
+    rows_auto_written = 0
+    rows_auto_dropped_all_missing = 0
+    rows_cross_written = 0
+
+    # Backward-compatible old key.
+    # Autos are no longer deliberately flagged by this function.
     rows_autos_flagged = 0
 
     for blt in range(nblts):
         ti = int(time_index_array[blt])
         ant1 = int(ant_1_array[blt])
         ant2 = int(ant_2_array[blt])
+        is_auto = ant1 == ant2
 
-        if ant1 == ant2 and include_autos:
-            keep_mask[blt] = True
-            rows_autos_flagged += 1
-            continue
+        if is_auto:
+            rows_auto_candidate += 1
 
         found_count = 0
 
@@ -821,10 +828,17 @@ def build_data_flag_nsample(
 
         if found_count == 0:
             rows_dropped_all_missing += 1
+            if is_auto:
+                rows_auto_dropped_all_missing += 1
             continue
 
         keep_mask[blt] = True
         rows_with_any_data += 1
+
+        if is_auto:
+            rows_auto_written += 1
+        else:
+            rows_cross_written += 1
 
         if found_count != len(POL_ORDER):
             rows_with_partial_pols += 1
@@ -832,7 +846,8 @@ def build_data_flag_nsample(
                 raise ValueError(
                     f"physical baseline row has only {found_count}/4 pol products "
                     f"at time_index={ti}, antenna1={ant1}, antenna2={ant2}. "
-                    "Use --allow-partial-pols to write missing products as flagged."
+                    "Allow partial polarizations to write missing products as "
+                    "flagged."
                 )
 
     for pol_index, corr in enumerate(POL_ORDER):
@@ -858,6 +873,10 @@ def build_data_flag_nsample(
         "rows_with_any_data": rows_with_any_data,
         "rows_with_partial_pols": rows_with_partial_pols,
         "rows_dropped_all_missing": rows_dropped_all_missing,
+        "rows_auto_candidate": rows_auto_candidate,
+        "rows_auto_written": rows_auto_written,
+        "rows_auto_dropped_all_missing": rows_auto_dropped_all_missing,
+        "rows_cross_written": rows_cross_written,
         "rows_autos_flagged": rows_autos_flagged,
         "unflagged_by_pol": unflagged_by_pol,
         "flagged_by_pol": flagged_by_pol,
@@ -1291,7 +1310,7 @@ def build_uvdata_object(
         warn(
             "Using manual UVData construction. "
             "This is intended for debugging only; production export should use "
-            "--uvdata-constructor new."
+            "the default UVData.new path."
         )
         uvd = build_uvdata_manual(ms_payload)
     else:
@@ -1369,11 +1388,10 @@ def verify_uvdata_payload_consistency(uvd: Any, payload: dict[str, Any]) -> None
 
 def prepare_ms_payload(
     h5: h5py.File,
-    include_autos: bool = False,
-    allow_partial_pols: bool = False,
+    include_autos: bool = True,
+    allow_partial_pols: bool = True,
     allow_uvw_warnings: bool = False,
     x_orientation: str = "east",
-    flip_uvw_sign: bool = False,
 ) -> dict[str, Any]:
     layout = build_physical_blt_axis(h5, include_autos=include_autos)
     packed = build_data_flag_nsample(
@@ -1393,7 +1411,8 @@ def prepare_ms_payload(
     if ant_1_array.size <= 0:
         raise ValueError(
             "no rows to write to MeasurementSet. "
-            "Check used antennas, input polarizations, and --include-autos."
+            "Check used antennas, input polarizations, and the current "
+            "auto-correlation policy."
         )
 
     uvw_array_m = build_uvw_array(
@@ -1403,13 +1422,6 @@ def prepare_ms_payload(
         time_index_array,
         allow_uvw_warnings=allow_uvw_warnings,
     )
-    if flip_uvw_sign:
-        warn(
-            "Applying --flip-uvw-sign: UVW sign is flipped after reading HDF5. "
-            "This should only be used for old HDF5 files with the pre-fix "
-            "katpoint UVW sign convention."
-        )
-        uvw_array_m = -uvw_array_m
 
     freq_array_hz = np.asarray(h5["frequency/chan_freq_hz"][()], dtype=np.float64)
     channel_width_hz = np.asarray(
@@ -1459,11 +1471,14 @@ def prepare_ms_payload(
         "rows_with_any_data": packed["rows_with_any_data"],
         "rows_with_partial_pols": packed["rows_with_partial_pols"],
         "rows_dropped_all_missing": packed["rows_dropped_all_missing"],
+        "rows_auto_candidate": packed["rows_auto_candidate"],
+        "rows_auto_written": packed["rows_auto_written"],
+        "rows_auto_dropped_all_missing": packed["rows_auto_dropped_all_missing"],
+        "rows_cross_written": packed["rows_cross_written"],
         "rows_autos_flagged": packed["rows_autos_flagged"],
         "include_autos": include_autos,
         "allow_partial_pols": allow_partial_pols,
         "allow_uvw_warnings": allow_uvw_warnings,
-        "flip_uvw_sign": flip_uvw_sign,
         "x_orientation": x_orientation,
         "unflagged_by_pol": packed["unflagged_by_pol"],
         "flagged_by_pol": packed["flagged_by_pol"],
@@ -1483,9 +1498,9 @@ def prepare_ms_payload(
             f"corr_output_mode={as_text(h5.attrs.get('corr_output_mode', 'unknown'))}; "
             f"polarization_order={','.join(POL_ORDER)}; "
             f"include_autos={include_autos}; "
+            f"auto_data_policy={'preserve_hdf5_data_even_if_zero' if include_autos else 'not_written'}; "
             f"allow_partial_pols={allow_partial_pols}; "
             f"x_orientation={x_orientation}; "
-            f"flip_uvw_sign={flip_uvw_sign}; "
             "uvw_source=/uvw/uvw_m; "
             f"uvw_method={as_text(h5['uvw'].attrs.get('method', 'unknown'))}; "
             f"frequency_axis_input_order={frequency_axis_input_order}; "
@@ -1509,7 +1524,9 @@ def print_payload_summary(h5: h5py.File, payload: dict[str, Any], include_autos:
     print("include autos            :", include_autos)
     print("allow partial pols       :", payload["allow_partial_pols"])
     print("allow uvw warnings       :", payload["allow_uvw_warnings"])
-    print("flip UVW sign            :", payload.get("flip_uvw_sign", False))
+    print("overwrite output         :", True)
+    print("uvdata constructor       :", "new")
+    print("uvw sign policy          :", "use HDF5 /uvw/uvw_m as-is")
     print("x orientation            :", payload["x_orientation"])
     print("polarization order       :", ", ".join(POL_ORDER))
     print(
@@ -1531,9 +1548,24 @@ def print_payload_summary(h5: h5py.File, payload: dict[str, Any], include_autos:
     print("rows with any data       :", payload["rows_with_any_data"])
     print("rows with partial pols   :", payload["rows_with_partial_pols"])
     print("rows dropped all missing :", payload["rows_dropped_all_missing"])
-    print("rows autos flagged       :", payload["rows_autos_flagged"])
+    print("rows auto candidate      :", payload.get("rows_auto_candidate", 0))
+    print("rows auto written        :", payload.get("rows_auto_written", 0))
+    print("rows auto dropped missing:", payload.get("rows_auto_dropped_all_missing", 0))
+    print("rows cross written       :", payload.get("rows_cross_written", 0))
+    print("rows autos flagged       :", payload.get("rows_autos_flagged", 0))
     print("unflagged by pol         :", payload["unflagged_by_pol"])
     print("flagged by pol           :", payload["flagged_by_pol"])
+    data_abs_max = float(np.max(np.abs(payload["data_array"])))
+    data_nonzero_count = int(np.count_nonzero(payload["data_array"]))
+    print("payload global max |DATA|:", data_abs_max)
+    print("payload nonzero samples  :", data_nonzero_count)
+    if data_abs_max <= 0.0:
+        warn(
+            "payload DATA are all zero. "
+            "The MeasurementSet can still be written for format and plotting "
+            "tests, but all visibility amplitudes are zero and phase plots have "
+            "no scientific meaning."
+        )
     print(
         "data array bytes         :",
         format_bytes(int(payload["data_array"].nbytes)),
@@ -1583,7 +1615,7 @@ def remove_existing_output(output_ms: str, overwrite: bool) -> None:
     if not overwrite:
         raise FileExistsError(
             f"output MeasurementSet already exists: {output_ms}. "
-            "Use --overwrite to replace it."
+            "Set overwrite=True to replace it."
         )
 
     if os.path.isdir(output_ms):
@@ -1663,6 +1695,95 @@ def verify_ms_with_casacore(output_ms: str, payload: dict[str, Any]) -> None:
         if flag_row.shape != (payload["Nblts"],):
             raise ValueError("FLAG_ROW shape mismatch")
 
+        auto_mask = ant1 == ant2
+        cross_mask = ant1 != ant2
+        print("MAIN auto rows:", int(np.sum(auto_mask)))
+        print("MAIN cross rows:", int(np.sum(cross_mask)))
+
+        if payload.get("include_autos", False):
+            if not np.any(auto_mask):
+                raise ValueError(
+                    "auto-correlations are required, but MAIN has no auto rows"
+                )
+
+            auto_uvw = uvw[auto_mask]
+            max_auto_uvw = float(np.max(np.abs(auto_uvw)))
+            if max_auto_uvw > 1e-6:
+                raise ValueError(f"auto rows should have zero UVW, max={max_auto_uvw}")
+
+            auto_row_indices = np.where(auto_mask)[0]
+            payload_auto_mask = payload["ant_1_array"] == payload["ant_2_array"]
+            payload_auto_data = np.asarray(payload["data_array"])[payload_auto_mask]
+            payload_auto_flag = np.asarray(payload["flag_array"])[payload_auto_mask]
+
+            if payload_auto_data.size == 0:
+                raise ValueError(
+                    "auto-correlations are required, but payload has no auto DATA "
+                    "rows"
+                )
+
+            if payload_auto_flag.shape != payload_auto_data.shape:
+                raise ValueError("payload auto FLAG/DATA shape mismatch")
+
+            payload_auto_row_max = np.max(np.abs(payload_auto_data), axis=(1, 2))
+            payload_auto_max = float(np.max(payload_auto_row_max))
+            payload_auto_nonzero_rows = int(np.sum(payload_auto_row_max > 0.0))
+
+            print("payload auto max |DATA|:", payload_auto_max)
+            print(
+                "payload auto nonzero rows:",
+                payload_auto_nonzero_rows,
+                "/",
+                int(payload_auto_row_max.size),
+            )
+
+            if payload_auto_max > 0.0:
+                # When payload autos contain real nonzero data, validate against
+                # a row that actually carries signal instead of blindly sampling
+                # the first timestamp.
+                local_auto_index = int(np.argmax(payload_auto_row_max))
+                sample_auto_row = int(auto_row_indices[local_auto_index])
+            else:
+                local_auto_index = 0
+                sample_auto_row = int(auto_row_indices[0])
+                warn(
+                    "payload auto DATA are all zero before MS writing. "
+                    "This is allowed for pipeline/format/plotting tests. "
+                    "It usually means the input .fil data or HDF5 /vis are all "
+                    "zero. The generated MS can still contain 0&0 and 1&1 auto "
+                    "rows, but phase/amplitude plots will not have scientific "
+                    "meaning."
+                )
+
+            auto_data = np.asarray(tb.getcell("DATA", sample_auto_row))
+            auto_flag = np.asarray(tb.getcell("FLAG", sample_auto_row))
+
+            if auto_data.shape not in [(4, payload["Nfreqs"]), (payload["Nfreqs"], 4)]:
+                raise ValueError(f"unexpected auto DATA shape: {auto_data.shape}")
+
+            if auto_flag.shape != auto_data.shape:
+                raise ValueError("auto FLAG shape mismatch")
+
+            if np.all(auto_flag):
+                raise ValueError(
+                    "sample auto row is fully flagged; autos should be unflagged "
+                    "when source HDF5 signal pairs exist, even if the DATA values "
+                    "are zero"
+                )
+
+            auto_data_max = float(np.max(np.abs(auto_data)))
+            print("sample auto row:", sample_auto_row)
+            print("sample auto local index:", local_auto_index)
+            print("MS sample auto max |DATA|:", auto_data_max)
+
+            if payload_auto_max > 0.0 and auto_data_max <= 0.0:
+                raise ValueError(
+                    "payload has nonzero auto DATA, but the corresponding MS auto "
+                    "row is all zero"
+                )
+        elif np.any(auto_mask):
+            raise ValueError("include_autos=False, but MAIN contains auto rows")
+
         if tb.nrows() > 0:
             data0 = np.asarray(tb.getcell("DATA", 0))
             flag0 = np.asarray(tb.getcell("FLAG", 0))
@@ -1734,13 +1855,21 @@ def verify_ms_subtables(output_ms: str, payload: dict[str, Any]) -> None:
 
         num_corr = int(np.asarray(pol.getcell("NUM_CORR", 0)).reshape(-1)[0])
         corr_type = np.asarray(pol.getcell("CORR_TYPE", 0), dtype=np.int64).reshape(-1)
+        print("MS CORR_TYPE:", corr_type)
+        print("expected CORR_TYPE:", MS_CORR_TYPES)
 
         if num_corr != len(POL_ORDER):
             raise ValueError(f"NUM_CORR mismatch: {num_corr} != {len(POL_ORDER)}")
         if corr_type.shape[0] != len(MS_CORR_TYPES):
             raise ValueError(f"CORR_TYPE length mismatch: {corr_type.shape[0]}")
         if not np.array_equal(corr_type, MS_CORR_TYPES):
-            raise ValueError(f"CORR_TYPE mismatch: {corr_type} != {MS_CORR_TYPES}")
+            raise ValueError(
+                "CORR_TYPE mismatch. "
+                f"MS has {corr_type.tolist()}, "
+                f"expected {MS_CORR_TYPES.tolist()} for POL_ORDER={POL_ORDER}. "
+                "If these do not match, plot_ms_phase_waterfall.py may select the "
+                "wrong correlation product."
+            )
     finally:
         pol.close()
 
@@ -1829,7 +1958,7 @@ def write_measurement_set(
     if os.path.exists(output_ms) and not overwrite:
         raise FileExistsError(
             f"output MeasurementSet already exists: {output_ms}. "
-            "Use --overwrite to replace it."
+            "Set overwrite=True to replace it."
         )
 
     uvd = build_uvdata_object(payload, constructor=uvdata_constructor)
@@ -1855,7 +1984,11 @@ def write_measurement_set(
 
 def parse_command_line(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert an MS-ready HDF5 file into a CASA MeasurementSet."
+        description=(
+            "Convert an MS-ready HDF5 file into a CASA MeasurementSet. "
+            "Default behavior: overwrite output, include auto-correlations, "
+            "allow partial polarizations, and use UVData.new."
+        )
     )
     parser.add_argument(
         "input_h5",
@@ -1866,43 +1999,11 @@ def parse_command_line(argv: list[str]) -> argparse.Namespace:
         help="output MeasurementSet directory",
     )
     parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="overwrite output.ms if it already exists",
-    )
-    parser.add_argument(
-        "--include-autos",
-        action="store_true",
-        help=(
-            "include antenna1 == antenna2 rows. "
-            "Autos are flagged in this first version."
-        ),
-    )
-    parser.add_argument(
-        "--allow-partial-pols",
-        action="store_true",
-        help=(
-            "allow physical baseline rows with fewer than 4 polarization products. "
-            "Missing products are written as zero and flagged. "
-            "Default is strict full-pol requirement."
-        ),
-    )
-    parser.add_argument(
         "--allow-uvw-warnings",
         action="store_true",
         help=(
             "downgrade UVW mismatch between polarization rows to warnings. "
             "Missing UVW is always fatal."
-        ),
-    )
-    parser.add_argument(
-        "--flip-uvw-sign",
-        action="store_true",
-        help=(
-            "flip the sign of UVW after reading it from HDF5. "
-            "This is only a compatibility option for old HDF5 files whose "
-            "UVW was written with the opposite katpoint sign convention. "
-            "Do not use for newly generated HDF5 files after the source UVW fix."
         ),
     )
     parser.add_argument(
@@ -1930,18 +2031,7 @@ def parse_command_line(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help=(
             "validate HDF5 schema and payload consistency only. "
-            "This runs stricter checks than --dry-run and exits before UVData "
-            "construction."
-        ),
-    )
-    parser.add_argument(
-        "--uvdata-constructor",
-        choices=["new", "manual"],
-        default="new",
-        help=(
-            "how to construct UVData before writing MS. "
-            "Default 'new' uses UVData.new with explicit pyuvdata-2.x compatible "
-            "arguments. 'manual' is for debugging only."
+            "This exits before writing a MeasurementSet."
         ),
     )
     return parser.parse_args(argv)
@@ -1955,23 +2045,32 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.isfile(args.input_h5):
         raise FileNotFoundError(args.input_h5)
 
+    # Production defaults:
+    #   - Always overwrite old MS output.
+    #   - Always include auto-correlations, so 0&0 and 1&1 are written.
+    #   - Allow missing polarization products as flagged data.
+    #   - Use UVData.new to construct the UVData object.
+    include_autos = True
+    allow_partial_pols = True
+    overwrite = True
+    uvdata_constructor = "new"
+
     with h5py.File(args.input_h5, "r") as h5:
         validate_hdf5_input(h5)
         estimate_and_check_memory(
             h5,
-            include_autos=args.include_autos,
+            include_autos=include_autos,
             max_memory_gb=args.max_memory_gb,
         )
         payload = prepare_ms_payload(
             h5,
-            include_autos=args.include_autos,
-            allow_partial_pols=args.allow_partial_pols,
+            include_autos=include_autos,
+            allow_partial_pols=allow_partial_pols,
             allow_uvw_warnings=args.allow_uvw_warnings,
-            flip_uvw_sign=args.flip_uvw_sign,
             x_orientation=args.x_orientation,
         )
         validate_payload_before_uvdata(payload)
-        print_payload_summary(h5, payload, include_autos=args.include_autos)
+        print_payload_summary(h5, payload, include_autos=include_autos)
 
         if args.validate_only:
             print("\n[VALIDATE-ONLY] HDF5 schema and payload validation passed.")
@@ -1984,8 +2083,8 @@ def main(argv: list[str] | None = None) -> int:
         write_measurement_set(
             args.output_ms,
             payload,
-            overwrite=args.overwrite,
-            uvdata_constructor=args.uvdata_constructor,
+            overwrite=overwrite,
+            uvdata_constructor=uvdata_constructor,
         )
 
     print("\n[OK] MeasurementSet written:", args.output_ms)

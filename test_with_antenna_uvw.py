@@ -2835,6 +2835,8 @@ def parse_command_line(argv):
     )
     parser.add_argument(
         "-ant",
+        "--antenna-txt",
+        dest="antenna_txt",
         default=ANTENNA_INFO_TXT,
         help=(
             "antenna position txt file. Format: "

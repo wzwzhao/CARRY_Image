@@ -1,15 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-plot_ms_phase_waterfall_cli.py
+plot_ms_phase_waterfall.py
 
 命令行直接运行版：
 
-    python plot_ms_phase_waterfall_cli.py 0X 1Y xxxx.ms
+    python plot_ms_phase_waterfall.py 0X 1Y xxxx.ms
 
 例子：
 
-    python plot_ms_phase_waterfall_cli.py 0X 1Y /home/carrylab/Downloads/conda/0705test.ms
+    python plot_ms_phase_waterfall.py 0X 1Y /home/carrylab/Downloads/conda/0705test.ms
 
 这会画：
 
@@ -21,13 +21,13 @@ plot_ms_phase_waterfall_cli.py
 
 图像含义：
 
-    横轴：频率 MHz
-    纵轴：这个 MS 文件对应 baseline 的完整持续时间 s
+    横轴：时间，单位 s，范围覆盖这个 MS 文件中所选 baseline 的完整持续时间
+    纵轴：频率，单位 MHz
     颜色：相位 rad，范围 [-pi, pi]
 
 也可以指定输出图片：
 
-    python plot_ms_phase_waterfall_cli.py 0X 1Y xxxx.ms out.png
+    python plot_ms_phase_waterfall.py 0X 1Y xxxx.ms out.png
 
 可选参数：
 
@@ -47,12 +47,116 @@ import argparse
 import os
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# Use English-only labels in figures to avoid CJK font glyph warnings on Linux.
+plt.rcParams["axes.unicode_minus"] = False
+
+
+# =============================================================================
+# Time conversion
+# =============================================================================
+
+# MeasurementSet TIME is stored in seconds since MJD 0.
+# Unix epoch corresponds to MJD 40587.0.
+MJD0_TO_UNIX_SECONDS = 40587.0 * 86400.0
+BEIJING_TZ = timezone(timedelta(hours=8), name="BJT")
+
+
+def infer_interval_sec(time_array, interval_sec):
+    """
+    Resolve a representative integration interval in seconds.
+
+    Prefer the MS INTERVAL column. If unavailable, infer it from the median
+    separation of adjacent TIME centers.
+    """
+    if interval_sec is not None:
+        interval_sec = float(interval_sec)
+        if np.isfinite(interval_sec) and interval_sec > 0.0:
+            return interval_sec
+
+    time_array = np.asarray(time_array, dtype=float)
+
+    if time_array.size > 1:
+        dt = np.median(np.diff(time_array))
+        if np.isfinite(dt) and dt > 0.0:
+            return float(dt)
+
+    return 0.0
+
+
+def get_time_edges_ms_seconds(time_array, interval_sec):
+    """
+    Return absolute MeasurementSet TIME edges in seconds since MJD 0.
+
+    TIME values in MAIN are row center times. To represent the full observation
+    span, use half an integration before the first center and half an
+    integration after the last center.
+    """
+    time_array = np.asarray(time_array, dtype=float)
+
+    if time_array.size == 0:
+        return 0.0, 0.0, 0.0
+
+    resolved_interval = infer_interval_sec(time_array, interval_sec)
+    start_edge = float(time_array[0]) - 0.5 * resolved_interval
+    end_edge = float(time_array[-1]) + 0.5 * resolved_interval
+
+    return start_edge, end_edge, resolved_interval
+
+
+def ms_time_seconds_to_unix_ms(ms_time_seconds):
+    """
+    Convert MeasurementSet TIME seconds to Unix milliseconds.
+
+    Rounding is done at the millisecond level so title timestamps are stable
+    and displayed exactly to ms precision.
+    """
+    unix_seconds = float(ms_time_seconds) - MJD0_TO_UNIX_SECONDS
+    return int(np.rint(unix_seconds * 1000.0))
+
+
+def unix_ms_to_beijing_text(unix_ms):
+    """
+    Format Unix milliseconds as Beijing time to millisecond precision.
+    """
+    unix_ms = int(unix_ms)
+    seconds = unix_ms // 1000
+    milliseconds = unix_ms % 1000
+    dt_utc = datetime.fromtimestamp(seconds, tz=timezone.utc)
+    dt_bjt = dt_utc.astimezone(BEIJING_TZ)
+    return dt_bjt.strftime("%Y-%m-%d %H:%M:%S") + ".{0:03d}".format(milliseconds)
+
+
+def get_beijing_time_range_text(time_array, interval_sec):
+    """
+    Build a Beijing-time range string from selected MS rows.
+
+    Returns:
+        start_text, end_text, range_text
+
+    Example:
+        2000-01-01 11:08:53.153 - 2000-01-01 11:08:53.653 BJT
+    """
+    start_edge, end_edge, _resolved_interval = get_time_edges_ms_seconds(
+        time_array,
+        interval_sec,
+    )
+    start_text = unix_ms_to_beijing_text(
+        ms_time_seconds_to_unix_ms(start_edge)
+    )
+    end_text = unix_ms_to_beijing_text(
+        ms_time_seconds_to_unix_ms(end_edge)
+    )
+    range_text = "{0} - {1} BJT".format(start_text, end_text)
+
+    return start_text, end_text, range_text
 
 
 # =============================================================================
@@ -211,7 +315,7 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         description=(
             "Plot phase waterfall from a CASA MeasurementSet for a selected "
-            "antenna/polarization pair. Example: python plot_ms_phase_waterfall_cli.py 0X 1Y test.ms"
+            "antenna/polarization pair. Example: python plot_ms_phase_waterfall.py 0X 1Y test.ms"
         )
     )
 
@@ -569,24 +673,74 @@ def get_time_extent_sec(time_array, interval_sec):
     if time_array.size == 0:
         return [0.0, 0.0]
 
-    if interval_sec is None:
-        if time_array.size > 1:
-            dt = np.median(np.diff(time_array))
-            if np.isfinite(dt) and dt > 0.0:
-                interval_sec = float(dt)
-            else:
-                interval_sec = 0.0
-        else:
-            interval_sec = 0.0
-
-    t_start_edge = float(time_array[0]) - 0.5 * float(interval_sec)
-    t_end_edge = float(time_array[-1]) + 0.5 * float(interval_sec)
+    t_start_edge, t_end_edge, _resolved_interval = get_time_edges_ms_seconds(
+        time_array,
+        interval_sec,
+    )
     duration = t_end_edge - t_start_edge
 
     if duration < 0.0:
         duration = 0.0
 
     return [0.0, float(duration)]
+
+
+def prepare_frequency_axis_for_plot(freq_hz, chan_width_hz, matrix_time_freq):
+    """
+    Prepare a frequency-ascending matrix for plotting.
+
+    Internal extraction convention:
+        matrix_time_freq.shape = (Ntime, Nfreq)
+
+    Desired image convention:
+        horizontal axis = time
+        vertical axis   = frequency
+
+    imshow expects:
+        image.shape = (Ny, Nx)
+
+    Therefore save_outputs() will transpose the returned matrix:
+        image = matrix_time_freq_sorted.T
+        image.shape = (Nfreq, Ntime)
+
+    This helper also sorts the frequency axis into ascending order when needed,
+    so the y-axis runs from low frequency to high frequency.
+    """
+    freq = np.asarray(freq_hz, dtype=float).reshape(-1)
+
+    if matrix_time_freq.ndim != 2:
+        raise RuntimeError(
+            "plot matrix must be 2D, got shape={0}".format(matrix_time_freq.shape)
+        )
+
+    if matrix_time_freq.shape[1] != freq.size:
+        raise RuntimeError(
+            "frequency axis mismatch: matrix shape={0}, freq size={1}".format(
+                matrix_time_freq.shape,
+                freq.size,
+            )
+        )
+
+    if chan_width_hz is None:
+        chan_width = None
+    else:
+        chan_width = np.asarray(chan_width_hz, dtype=float).reshape(-1)
+        if chan_width.size != freq.size:
+            chan_width = None
+
+    order = np.argsort(freq)
+
+    if np.array_equal(order, np.arange(freq.size)):
+        return freq, chan_width, matrix_time_freq
+
+    matrix_sorted = matrix_time_freq[:, order]
+
+    if chan_width is None:
+        chan_width_sorted = None
+    else:
+        chan_width_sorted = chan_width[order]
+
+    return freq[order], chan_width_sorted, matrix_sorted
 
 
 # =============================================================================
@@ -632,13 +786,28 @@ def save_outputs(
     else:
         raise ValueError("bad mode: {0}".format(mode))
 
-    x_extent = get_frequency_extent_mhz(freq_hz, chan_width_hz)
-    y_extent = get_time_extent_sec(time_array, interval_sec)
-    extent = [x_extent[0], x_extent[1], y_extent[0], y_extent[1]]
+    # Internal matrix convention from extraction:
+    #     plot_matrix.shape = (Ntime, Nfreq)
+    #
+    # Requested plot convention:
+    #     horizontal axis = time
+    #     vertical axis   = frequency
+    #
+    # imshow uses image.shape = (Ny, Nx), so transpose to:
+    #     image_matrix.shape = (Nfreq, Ntime)
+    freq_hz_plot, chan_width_hz_plot, plot_matrix_plot = prepare_frequency_axis_for_plot(
+        freq_hz,
+        chan_width_hz,
+        plot_matrix,
+    )
+    time_extent = get_time_extent_sec(time_array, interval_sec)
+    freq_extent = get_frequency_extent_mhz(freq_hz_plot, chan_width_hz_plot)
+    extent = [time_extent[0], time_extent[1], freq_extent[0], freq_extent[1]]
+    image_matrix = plot_matrix_plot.T
 
     plt.figure(figsize=(12, 6))
     plt.imshow(
-        plot_matrix,
+        image_matrix,
         aspect="auto",
         origin="lower",
         extent=extent,
@@ -647,13 +816,22 @@ def save_outputs(
         interpolation="nearest",
     )
     plt.colorbar(label=colorbar_label)
-    plt.xlabel("Frequency (MHz)")
-    plt.ylabel("Time from MS start (s)")
+    plt.xlabel("Time from MS start (s)")
+    plt.ylabel("Frequency (MHz)")
+    _start_bjt, _end_bjt, bjt_range_text = get_beijing_time_range_text(
+        time_array,
+        interval_sec,
+    )
+    pol_pair_label = "{0} {1} ({2})".format(
+        args.signal1,
+        args.signal2,
+        pol_a + pol_b,
+    )
     plt.title(
-        "{0}: {1} x conj({2})".format(
+        "{0} | Pol pair: {1}\nBJT: {2}".format(
             title_prefix,
-            args.signal1,
-            args.signal2,
+            pol_pair_label,
+            bjt_range_text,
         )
     )
     plt.tight_layout()
@@ -706,9 +884,23 @@ def save_outputs(
                 pol_b,
             ))
             f.write("Mode: {0}\n".format(args.mode))
+            start_bjt, end_bjt, bjt_range_text = get_beijing_time_range_text(
+                time_array,
+                interval_sec,
+            )
+            f.write("BJT start: {0}\n".format(start_bjt))
+            f.write("BJT end: {0}\n".format(end_bjt))
+            f.write("BJT time range: {0}\n".format(bjt_range_text))
+            f.write("Polarization pair label: {0} {1} ({2})\n".format(
+                args.signal1,
+                args.signal2,
+                pol_a + pol_b,
+            ))
             f.write("Selected rows: {0}\n".format(vis_matrix.shape[0]))
             f.write("Frequency channels: {0}\n".format(vis_matrix.shape[1]))
             f.write("Matrix shape: {0}\n".format(vis_matrix.shape))
+            f.write("Matrix convention: rows=time, columns=frequency\n")
+            f.write("Plot orientation: x-axis=time, y-axis=frequency\n")
             f.write("Forward rows: {0}\n".format(row_direction.count("forward")))
             f.write("Reverse rows conjugated: {0}\n".format(
                 row_direction.count("reverse_conjugated")
@@ -819,13 +1011,23 @@ def main(argv=None):
     )
 
     time_extent = get_time_extent_sec(time_array, interval_sec)
+    start_bjt, end_bjt, bjt_range_text = get_beijing_time_range_text(
+        time_array,
+        interval_sec,
+    )
 
     print("\n========== MATRIX ==========")
     print("complex visibility matrix shape:", vis_matrix.shape)
     print("flag matrix shape:", flag_matrix.shape)
+    print("matrix convention: rows=time, columns=frequency")
+    print("plot orientation: x-axis=time, y-axis=frequency")
     print("interval sec:", interval_sec)
     print("TIME center span sec:", float(time_array[-1] - time_array[0]))
     print("displayed duration sec:", float(time_extent[1] - time_extent[0]))
+    print("BJT start:", start_bjt)
+    print("BJT end:", end_bjt)
+    print("BJT time range:", bjt_range_text)
+    print("title polarization pair:", "{0} {1} ({2})".format(args.signal1, args.signal2, pol_a + pol_b))
     print("phase min/max rad:", float(np.nanmin(np.angle(vis_matrix))), float(np.nanmax(np.angle(vis_matrix))))
     print("flagged fraction:", float(np.sum(flag_matrix)) / float(flag_matrix.size))
     print("forward rows:", row_direction.count("forward"))
