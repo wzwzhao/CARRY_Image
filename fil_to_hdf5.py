@@ -38,7 +38,7 @@ MAX_FILES = 20
 # 注意：
 #   这里检查的是 fil header 里面的 nbits
 #   你的复数频点总大小由 BITS_PER_FREQ_POINT 控制
-REQUIRED_NBITS = 8
+REQUIRED_NBITS = 16
 
 # 天线编号范围
 # 文件名里 xx 从 00 到 09，表示10面天线
@@ -50,9 +50,15 @@ MAX_ANTENNA_ID = 9
 VALID_POLARIZATIONS = [0, 1]
 
 # 输出HDF5文件
-# None 表示根据第一个输入文件 header 里的 tstart 自动生成：
-# YYYYMMDDHHMMSSmmm_YYYYMMDDHHMMSSmmm.h5
+# None 表示根据第一个输入文件 header 里的 tstart 和 -o 参数自动生成：
+# YYYYMMDDHHMMSSmmm_YYYYMMDDHHMMSSmmm_cal.h5
+# 或：
+# YYYYMMDDHHMMSSmmm_YYYYMMDDHHMMSSmmm_tar.h5
+#
+# cal / tar 后缀只用于文件管理和人工识别；
+# HDF5 内部 observation_role_code / ms_obs_mode 仍为正式机器可读元数据。
 OUTPUT_HDF5_FILE = None
+OUTPUT_HDF5_DIR = None
 
 # 是否把相关结果写入HDF5文件
 # True ：正常落盘保存
@@ -80,7 +86,7 @@ ANTENNA_DISH_DIAMETER_M = 1.0
 ANTENNA_POSITION_ITRF_M = None
 
 # antenna txt file for real antenna positions.
-# None means use placeholder positions unless --antenna-txt is given.
+# CARRY_PHASE1 HDF5 generation requires --antenna-txt / -ant.
 # Format:
 #   # name lat lon [alt_m] [diam_m]
 #   ant0 29.784402 109.779625 1581 7.5
@@ -89,6 +95,13 @@ ANTENNA_TXT_NAME_PREFIX = "ant"
 ANTENNA_POSITION_FRAME = "ITRF/WGS84_ECEF"
 _ANTENNA_INFO_CACHE = None
 _ANTENNA_INFO_CACHE_PATH = None
+
+# array / observatory metadata for future MS export
+ARRAY_NAME = "CARRY_PHASE1"
+ARRAY_CONFIG_NAME = "CARRY_PHASE1"
+ARRAY_CENTER_SOURCE = "mean_of_phase1_antennas"
+ARRAY_POSITION_FRAME = "ITRF/WGS84_ECEF"
+PHASE1_ANTENNA_IDS = (0, 1, 2, 3)
 
 # =========================
 # Field / phase center metadata
@@ -126,6 +139,22 @@ MS_ROW_SELECTION_MODE = "PRESENT_SIGNALS_ONLY"
 #   "mean" : save average over FFT_PER_CORR
 CORR_OUTPUT_MODE = "sum"
 
+# =========================
+# Observation role metadata
+# =========================
+
+OBSERVATION_ROLE_MAP = {
+    "cal": {
+        # Current project convention: cal means phase calibrator.
+        "role_name": "calibrator",
+        "ms_obs_mode": "CALIBRATE_PHASE#ON_SOURCE",
+    },
+    "tar": {
+        "role_name": "target",
+        "ms_obs_mode": "OBSERVE_TARGET#ON_SOURCE",
+    },
+}
+
 
 # =========================
 # 第二部分：相关计算参数
@@ -135,10 +164,10 @@ CORR_OUTPUT_MODE = "sum"
 N_INPUT_SIGNALS = 20
 
 # 1个积分周期包含多少个FFT
-FFT_PER_INTEGRATION = 10
+FFT_PER_INTEGRATION = 12
 
 # 1个fil文件包含多少个积分周期
-INTEGRATION_PER_FILE = 12500
+INTEGRATION_PER_FILE = 30000
 
 # 1个fil文件理论包含多少个FFT
 FFT_PER_FILE = FFT_PER_INTEGRATION * INTEGRATION_PER_FILE
@@ -518,6 +547,30 @@ def check_corr_config():
 
     if CORR_OUTPUT_MODE not in ["sum", "mean"]:
         raise ValueError("CORR_OUTPUT_MODE must be 'sum' or 'mean'")
+
+
+def get_observation_metadata(obs_type):
+    """
+    Return descriptive observation-role metadata from the command line value.
+
+    This metadata is intentionally independent of FIELD, UVW, visibility,
+    time, and frequency calculations.
+    """
+    obs_type = str(obs_type).strip().lower()
+
+    if obs_type not in OBSERVATION_ROLE_MAP:
+        raise ValueError(
+            f"bad observation type: {obs_type}; "
+            f"allowed values are: {', '.join(sorted(OBSERVATION_ROLE_MAP))}"
+        )
+
+    role_info = OBSERVATION_ROLE_MAP[obs_type]
+
+    return {
+        "role_code": obs_type,
+        "role_name": role_info["role_name"],
+        "ms_obs_mode": role_info["ms_obs_mode"],
+    }
 
 
 # =========================
@@ -1098,27 +1151,133 @@ def get_hdf5_time_info(infos):
     }
 
 
-def get_output_hdf5_file(infos):
+def add_observation_role_suffix(file_path, role_code):
     """
-    获取 HDF5 输出文件名。
+    在 HDF5 文件扩展名前增加观测角色后缀。
 
-    如果 OUTPUT_HDF5_FILE 不为 None：
-        使用用户手动指定的文件名。
+    例子：
+        data.h5 + cal -> data_cal.h5
+        data.h5 + tar -> data_tar.h5
 
-    如果 OUTPUT_HDF5_FILE 为 None：
-        根据第一个输入文件 header["tstart"] 自动生成时间段文件名：
-
-        YYYYMMDDHHMMSSmmm_YYYYMMDDHHMMSSmmm.h5
+    规则：
+        1. role_code 只能是 cal 或 tar；
+        2. 已有正确后缀时不重复追加；
+        3. 已有相反角色后缀时直接报错；
+        4. 保留目录路径；
+        5. 输出扩展名必须是 .h5。
     """
+    role_code = str(role_code).strip().lower()
+
+    if role_code not in OBSERVATION_ROLE_MAP:
+        raise ValueError(
+            f"bad observation role for output filename: {role_code}"
+        )
+
+    file_path = str(file_path)
+    directory = os.path.dirname(file_path)
+    base_name = os.path.basename(file_path)
+    stem, extension = os.path.splitext(base_name)
+
+    if extension.lower() != ".h5":
+        raise ValueError(
+            f"output HDF5 filename must end with .h5: {file_path}"
+        )
+
+    expected_suffix = f"_{role_code}"
+    opposite_role = "tar" if role_code == "cal" else "cal"
+    opposite_suffix = f"_{opposite_role}"
+    stem_lower = stem.lower()
+
+    if stem_lower.endswith(expected_suffix):
+        if stem.endswith(expected_suffix):
+            output_name = stem + extension
+        else:
+            output_name = stem[:-len(expected_suffix)] + expected_suffix + extension
+        return os.path.join(directory, output_name)
+
+    if stem_lower.endswith(opposite_suffix):
+        raise ValueError(
+            "output filename role conflicts with command line role: "
+            f"filename={file_path}, role={role_code}"
+        )
+
+    output_name = stem + expected_suffix + extension
+
+    return os.path.join(directory, output_name)
+
+
+def validate_output_filename_role(output_file, observation_meta):
+    """
+    验证输出文件名后缀与 observation_meta 一致。
+    """
+    role_code = str(observation_meta["role_code"]).strip().lower()
+
+    if role_code not in OBSERVATION_ROLE_MAP:
+        raise ValueError(
+            f"bad observation role for output filename: {role_code}"
+        )
+
+    stem = os.path.splitext(os.path.basename(output_file))[0]
+    expected_suffix = f"_{role_code}"
+
+    if not stem.lower().endswith(expected_suffix):
+        raise ValueError(
+            "output filename does not match observation role: "
+            f"file={output_file}, role={role_code}"
+        )
+
+
+def get_output_hdf5_file(infos, observation_meta):
+    """
+    获取带观测角色后缀的 HDF5 输出文件名。
+
+    自动命名格式：
+        YYYYMMDDHHMMSSmmm_YYYYMMDDHHMMSSmmm_cal.h5
+        YYYYMMDDHHMMSSmmm_YYYYMMDDHHMMSSmmm_tar.h5
+
+    手动设置 OUTPUT_HDF5_FILE 时：
+        也会在扩展名前加入对应角色后缀；
+        已有正确后缀时不重复添加；
+        已有相反角色后缀时直接报错。
+    """
+    role_code = str(observation_meta["role_code"]).strip().lower()
+
+    if role_code not in OBSERVATION_ROLE_MAP:
+        raise ValueError(
+            f"bad observation role for output filename: {role_code}"
+        )
+
     if OUTPUT_HDF5_FILE is not None:
-        return OUTPUT_HDF5_FILE
+        return add_observation_role_suffix(
+            OUTPUT_HDF5_FILE,
+            role_code
+        )
 
     time_info = get_hdf5_time_info(infos)
+    base_file = (
+        f"{time_info['start_name']}_"
+        f"{time_info['end_name']}.h5"
+    )
 
-    return f"{time_info['start_name']}_{time_info['end_name']}.h5"
+    output_file = add_observation_role_suffix(
+        base_file,
+        role_code
+    )
+
+    if OUTPUT_HDF5_DIR is not None:
+        output_file = os.path.join(OUTPUT_HDF5_DIR, output_file)
+
+    return output_file
 
 
 def check_output_file(output_file):
+    output_dir = os.path.dirname(os.path.abspath(output_file))
+
+    if output_dir != "":
+        if os.path.exists(output_dir) and not os.path.isdir(output_dir):
+            raise NotADirectoryError(f"output directory is not a directory: {output_dir}")
+        os.makedirs(output_dir, exist_ok=True)
+
     if os.path.exists(output_file):
         if OVERWRITE_OUTPUT:
             os.remove(output_file)
@@ -1149,6 +1308,16 @@ def write_correlation_block(h5, corr_start, corr_end, vis_dict):
 # Clean MS-ready HDF5 writer definitions.
 def get_string_dtype():
     return h5py.string_dtype(encoding="utf-8")
+
+
+def as_text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, np.ndarray):
+        if value.shape == ():
+            return as_text(value[()])
+        return str(value)
+    return str(value)
 
 
 def _split_angle_text(text):
@@ -1232,6 +1401,44 @@ def parse_dms_to_rad(text):
         raise ValueError(f"Dec degree out of range: {signed_degree}")
 
     return np.deg2rad(signed_degree)
+
+
+def parse_field_argument(text):
+    """
+    Parse command-line field text:
+        "RA_HMS DEC_DMS"
+
+    Example:
+        "19:35:00.00 21:54:00.00"
+    """
+    if text is None:
+        return None
+
+    clean = str(text).strip().replace(",", " ")
+    parts = [part for part in clean.split() if part != ""]
+
+    if len(parts) != 2:
+        raise ValueError(
+            '-field expects one quoted value: "RA_HMS DEC_DMS", '
+            'for example: -field "19:35:00.00 21:54:00.00"'
+        )
+
+    ra_hms = parts[0]
+    dec_dms = parts[1]
+    ra_rad = float(parse_hms_to_rad(ra_hms))
+    dec_rad = float(parse_dms_to_rad(dec_dms))
+
+    return ra_hms, dec_dms, ra_rad, dec_rad
+
+
+def apply_field_argument(text):
+    global FIELD_RA_HMS, FIELD_DEC_DMS, FIELD_RA_RAD, FIELD_DEC_RAD
+
+    parsed = parse_field_argument(text)
+    if parsed is None:
+        return
+
+    FIELD_RA_HMS, FIELD_DEC_DMS, FIELD_RA_RAD, FIELD_DEC_RAD = parsed
 
 
 def get_field_phase_center():
@@ -1332,6 +1539,60 @@ def geodetic_to_itrf_m(lat_deg, lon_deg, alt_m):
     z = (normal_radius * (1.0 - eccentricity2) + alt_m) * sin_lat
 
     return np.array([x, y, z], dtype=np.float64)
+
+
+def itrf_m_to_geodetic_deg(x_m, y_m, z_m):
+    """
+    Convert ITRF/ECEF XYZ in meters to WGS84 longitude, latitude and height.
+
+    Returns:
+        lon_deg, lat_deg, alt_m
+    """
+    x = float(x_m)
+    y = float(y_m)
+    z = float(z_m)
+
+    radius = float(np.sqrt(x * x + y * y + z * z))
+    if radius < 6000000.0 or radius > 7000000.0:
+        raise ValueError(
+            f"ITRF radius does not look like Earth coordinate: {radius}"
+        )
+
+    semi_major_axis_m = 6378137.0
+    flattening = 1.0 / 298.257223563
+    eccentricity2 = flattening * (2.0 - flattening)
+
+    lon_rad = np.arctan2(y, x)
+    p = np.sqrt(x * x + y * y)
+    lat_rad = np.arctan2(z, p * (1.0 - eccentricity2))
+
+    for _index in range(20):
+        sin_lat = np.sin(lat_rad)
+        normal_radius = semi_major_axis_m / np.sqrt(
+            1.0 - eccentricity2 * sin_lat * sin_lat
+        )
+        alt_m = p / np.cos(lat_rad) - normal_radius
+        lat_new = np.arctan2(
+            z,
+            p * (1.0 - eccentricity2 * normal_radius / (normal_radius + alt_m))
+        )
+
+        if abs(lat_new - lat_rad) < 1e-14:
+            lat_rad = lat_new
+            break
+
+        lat_rad = lat_new
+
+    sin_lat = np.sin(lat_rad)
+    normal_radius = semi_major_axis_m / np.sqrt(
+        1.0 - eccentricity2 * sin_lat * sin_lat
+    )
+    alt_m = p / np.cos(lat_rad) - normal_radius
+
+    lon_deg = np.rad2deg(lon_rad)
+    lat_deg = np.rad2deg(lat_rad)
+
+    return float(lon_deg), float(lat_deg), float(alt_m)
 
 
 def deg_to_dms_str_for_katpoint(value_deg):
@@ -1504,6 +1765,31 @@ def get_used_antenna_ids(signal_map):
     return sorted(used)
 
 
+def validate_phase1_antenna_catalog(catalog):
+    expected_ids = set(PHASE1_ANTENNA_IDS)
+    actual_ids = set(int(antenna_id) for antenna_id in catalog.keys())
+
+    if actual_ids != expected_ids:
+        missing_ids = sorted(expected_ids - actual_ids)
+        extra_ids = sorted(actual_ids - expected_ids)
+        details = []
+
+        if missing_ids:
+            details.append(
+                "missing " + ", ".join([f"ant{item}" for item in missing_ids])
+            )
+
+        if extra_ids:
+            details.append(
+                "unexpected " + ", ".join([f"ant{item}" for item in extra_ids])
+            )
+
+        raise ValueError(
+            "CARRY_PHASE1 antenna txt must contain exactly ant0-ant3; "
+            + "; ".join(details)
+        )
+
+
 def check_antenna_info_for_inputs(signal_map):
     """
     检查天线 txt 能否覆盖本次实际输入的天线。
@@ -1515,10 +1801,12 @@ def check_antenna_info_for_inputs(signal_map):
     used_ids = get_used_antenna_ids(signal_map)
 
     if ANTENNA_INFO_TXT is None:
-        print("[WARN] no antenna txt given, antenna positions will be placeholders")
-        return
+        raise ValueError(
+            "CARRY_PHASE1 requires -ant/--antenna-txt with real ant0-ant3 rows"
+        )
 
     catalog = get_antenna_catalog()
+    validate_phase1_antenna_catalog(catalog)
     missing_ids = [antenna_id for antenna_id in used_ids if antenna_id not in catalog]
 
     if len(missing_ids) > 0:
@@ -1540,67 +1828,27 @@ def build_antenna_axis_metadata(signal_map=None):
     """
     生成 HDF5 /antenna 分组要保存的元数据。
 
-    对于天线 txt 中存在的天线：
-        使用 txt 中的 name / lat / lon / alt / diam，
-        并把经纬度海拔转换成 ITRF/ECEF XYZ。
-
-    对于 txt 中不存在的天线：
-        保留占位坐标，避免只输入部分天线时程序崩溃。
-        后续转 MS 时，这类天线如果没有数据行，应保持 flag。
+    /antenna 只记录 antenna txt 中真实存在的天线。
+    系统 20 路输入能力继续由 /signal 表达，未输入通道不再变成假天线行。
     """
     catalog = get_antenna_catalog()
-    antenna_ids = np.arange(
-        MIN_ANTENNA_ID,
-        MIN_ANTENNA_ID + N_PHYSICAL_ANTENNAS,
-        dtype=np.int16
-    )
+    if ANTENNA_INFO_TXT is not None:
+        validate_phase1_antenna_catalog(catalog)
 
     names = []
     stations = []
-    latitude_deg = np.full(N_PHYSICAL_ANTENNAS, np.nan, dtype=np.float64)
-    longitude_deg = np.full(N_PHYSICAL_ANTENNAS, np.nan, dtype=np.float64)
-    altitude_m = np.full(N_PHYSICAL_ANTENNAS, np.nan, dtype=np.float64)
-    dish_diameter_m = np.full(
-        N_PHYSICAL_ANTENNAS,
-        float(ANTENNA_DISH_DIAMETER_M),
-        dtype=np.float64
-    )
-    position_itrf_m = np.zeros((N_PHYSICAL_ANTENNAS, 3), dtype=np.float64)
-    present_in_txt = np.zeros(N_PHYSICAL_ANTENNAS, dtype=np.int8)
-    position_is_placeholder_by_antenna = np.ones(
-        N_PHYSICAL_ANTENNAS,
-        dtype=np.int8
-    )
-
-    if signal_map is None:
-        used_in_input = np.zeros(N_PHYSICAL_ANTENNAS, dtype=np.int8)
-    else:
-        used_in_input = np.zeros(N_PHYSICAL_ANTENNAS, dtype=np.int8)
-        for antenna_id in get_used_antenna_ids(signal_map):
-            used_in_input[antenna_id - MIN_ANTENNA_ID] = 1
-
-    for local_index, antenna_id in enumerate(antenna_ids):
-        antenna_id_int = int(antenna_id)
-        default_name = ANTENNA_NAMES[local_index]
-        default_station = ANTENNA_STATIONS[local_index]
-
-        item = catalog.get(antenna_id_int)
-
-        if item is None:
-            names.append(default_name)
-            stations.append(default_station)
-            position_itrf_m[local_index, 0] = float(antenna_id_int) * 10.0
-            continue
-
-        names.append(item["name"])
-        stations.append(item["station"])
-        latitude_deg[local_index] = item["lat_deg"]
-        longitude_deg[local_index] = item["lon_deg"]
-        altitude_m[local_index] = item["alt_m"]
-        dish_diameter_m[local_index] = item["diam_m"]
-        position_itrf_m[local_index, :] = item["position_itrf_m"]
-        present_in_txt[local_index] = 1
-        position_is_placeholder_by_antenna[local_index] = 0
+    catalog_ids = sorted(catalog.keys())
+    antenna_ids = np.array(catalog_ids, dtype=np.int16)
+    n_antenna = len(catalog_ids)
+    latitude_deg = np.zeros(n_antenna, dtype=np.float64)
+    longitude_deg = np.zeros(n_antenna, dtype=np.float64)
+    altitude_m = np.zeros(n_antenna, dtype=np.float64)
+    dish_diameter_m = np.zeros(n_antenna, dtype=np.float64)
+    position_itrf_m = np.zeros((n_antenna, 3), dtype=np.float64)
+    present_in_txt = np.ones(n_antenna, dtype=np.int8)
+    used_in_input = np.zeros(n_antenna, dtype=np.int8)
+    position_is_placeholder_by_antenna = np.zeros(n_antenna, dtype=np.int8)
+    used_ids = set() if signal_map is None else set(get_used_antenna_ids(signal_map))
 
     if ANTENNA_POSITION_ITRF_M is not None:
         manual_positions = np.asarray(ANTENNA_POSITION_ITRF_M, dtype=np.float64)
@@ -1610,12 +1858,27 @@ def build_antenna_axis_metadata(signal_map=None):
                 "ANTENNA_POSITION_ITRF_M must have shape "
                 f"({N_PHYSICAL_ANTENNAS}, 3)"
             )
+    else:
+        manual_positions = None
 
-        position_itrf_m = manual_positions
-        position_is_placeholder_by_antenna[:] = 0
+    for local_index, antenna_id in enumerate(catalog_ids):
+        item = catalog[int(antenna_id)]
+        names.append(item["name"])
+        stations.append(item["station"])
+        latitude_deg[local_index] = item["lat_deg"]
+        longitude_deg[local_index] = item["lon_deg"]
+        altitude_m[local_index] = item["alt_m"]
+        dish_diameter_m[local_index] = item["diam_m"]
+        if manual_positions is None:
+            position_itrf_m[local_index, :] = item["position_itrf_m"]
+        else:
+            position_itrf_m[local_index, :] = manual_positions[
+                int(antenna_id) - MIN_ANTENNA_ID
+            ]
+        used_in_input[local_index] = np.int8(int(antenna_id) in used_ids)
 
     position_is_placeholder = np.int8(
-        np.any(position_is_placeholder_by_antenna != 0)
+        1 if n_antenna == 0 else np.any(position_is_placeholder_by_antenna != 0)
     )
 
     return {
@@ -1631,6 +1894,86 @@ def build_antenna_axis_metadata(signal_map=None):
         "used_in_input": used_in_input,
         "position_is_placeholder_by_antenna": position_is_placeholder_by_antenna,
         "position_is_placeholder": position_is_placeholder,
+    }
+
+
+def build_array_metadata(signal_map=None):
+    """
+    Build array-level observatory metadata from antenna txt.
+
+    The array center is computed from all valid antennas in antenna.txt, not
+    only antennas used in this input observation.
+    """
+    catalog = get_antenna_catalog()
+
+    if len(catalog) == 0:
+        used_ids = [] if signal_map is None else get_used_antenna_ids(signal_map)
+        return {
+            "name": ARRAY_NAME,
+            "config_name": ARRAY_CONFIG_NAME,
+            "center_itrf_m": np.zeros(3, dtype=np.float64),
+            "center_longitude_deg": np.float64(np.nan),
+            "center_latitude_deg": np.float64(np.nan),
+            "center_altitude_m": np.float64(np.nan),
+            "center_source": "placeholder_no_antenna_txt",
+            "position_frame": ARRAY_POSITION_FRAME,
+            "antenna_ids_used_for_center": np.array([], dtype=np.int16),
+            "n_antenna_in_txt": np.int16(0),
+            "antenna_ids_used_in_input": np.array(used_ids, dtype=np.int16),
+            "n_antenna_used_in_input": np.int16(len(used_ids)),
+            "center_is_placeholder": np.int8(1),
+        }
+
+    valid_ids = sorted(catalog.keys())
+    validate_phase1_antenna_catalog(catalog)
+    positions = np.array(
+        [catalog[antenna_id]["position_itrf_m"] for antenna_id in valid_ids],
+        dtype=np.float64
+    )
+
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError(
+            f"bad antenna txt ITRF position shape for array center: {positions.shape}"
+        )
+
+    if positions.shape[0] == 0:
+        raise ValueError("no valid antenna positions for array center")
+
+    if np.any(~np.isfinite(positions)):
+        raise ValueError("antenna txt contains non-finite ITRF positions")
+
+    center_itrf_m = np.mean(positions, axis=0)
+
+    if not np.all(np.isfinite(center_itrf_m)):
+        raise ValueError("array center ITRF has non-finite values")
+
+    radius = float(np.linalg.norm(center_itrf_m))
+    if radius < 6000000.0 or radius > 7000000.0:
+        raise ValueError(
+            f"array center ITRF radius does not look like Earth coordinate: {radius}"
+        )
+
+    lon_deg, lat_deg, alt_m = itrf_m_to_geodetic_deg(
+        center_itrf_m[0],
+        center_itrf_m[1],
+        center_itrf_m[2],
+    )
+    used_ids = [] if signal_map is None else get_used_antenna_ids(signal_map)
+
+    return {
+        "name": ARRAY_NAME,
+        "config_name": ARRAY_CONFIG_NAME,
+        "center_itrf_m": center_itrf_m.astype(np.float64),
+        "center_longitude_deg": np.float64(lon_deg),
+        "center_latitude_deg": np.float64(lat_deg),
+        "center_altitude_m": np.float64(alt_m),
+        "center_source": ARRAY_CENTER_SOURCE,
+        "position_frame": ARRAY_POSITION_FRAME,
+        "antenna_ids_used_for_center": np.array(valid_ids, dtype=np.int16),
+        "n_antenna_in_txt": np.int16(len(valid_ids)),
+        "antenna_ids_used_in_input": np.array(used_ids, dtype=np.int16),
+        "n_antenna_used_in_input": np.int16(len(used_ids)),
+        "center_is_placeholder": np.int8(0),
     }
 
 
@@ -1981,12 +2324,21 @@ def write_signal_metadata(h5, signal_map):
     )
 
 
-def write_global_metadata(h5, infos, n_corr_time, n_baseline):
+def write_global_metadata(
+    h5,
+    infos,
+    n_corr_time,
+    n_baseline,
+    observation_meta
+):
     ref_header = infos[0]["header"]
     ref_fname = infos[0]["fname"]
     time_info = get_hdf5_time_info(infos)
 
     h5.attrs["source_name"] = str(ref_header.get("source_name", ""))
+    h5.attrs["observation_role_code"] = observation_meta["role_code"]
+    h5.attrs["observation_role"] = observation_meta["role_name"]
+    h5.attrs["ms_obs_mode"] = observation_meta["ms_obs_mode"]
     h5.attrs["time_tag"] = str(ref_fname.get("time_tag", ""))
     h5.attrs["tstart"] = ref_header.get("tstart", 0.0)
     h5.attrs["data_start_mjd"] = float(time_info["start_mjd"])
@@ -2016,6 +2368,9 @@ def write_global_metadata(h5, infos, n_corr_time, n_baseline):
     h5.attrs["output_dtype"] = OUTPUT_DTYPE_NAME
     h5.attrs["corr_output_mode"] = CORR_OUTPUT_MODE
     h5.attrs["corr_save_mode"] = CORR_OUTPUT_MODE
+    h5.attrs["array_name"] = ARRAY_NAME
+    h5.attrs["array_config_name"] = ARRAY_CONFIG_NAME
+    h5.attrs["array_position_frame"] = ARRAY_POSITION_FRAME
     h5.attrs["corr_normalization_factor"] = (
         np.float32(1.0)
         if CORR_OUTPUT_MODE == "sum"
@@ -2139,6 +2494,102 @@ def write_antenna_group(h5, signal_map):
     group.attrs["position_frame"] = ANTENNA_POSITION_FRAME
     group.attrs["lat_lon_unit"] = "degree"
     group.attrs["altitude_unit"] = "m"
+
+
+def write_array_group(h5, signal_map):
+    string_dtype = get_string_dtype()
+    array_meta = build_array_metadata(signal_map)
+    group = h5.create_group("array")
+
+    group.create_dataset(
+        "name",
+        data=array_meta["name"],
+        dtype=string_dtype
+    )
+    group.create_dataset(
+        "config_name",
+        data=array_meta["config_name"],
+        dtype=string_dtype
+    )
+    group.create_dataset(
+        "center_itrf_m",
+        data=array_meta["center_itrf_m"]
+    )
+    group.create_dataset(
+        "center_longitude_deg",
+        data=array_meta["center_longitude_deg"]
+    )
+    group.create_dataset(
+        "center_latitude_deg",
+        data=array_meta["center_latitude_deg"]
+    )
+    group.create_dataset(
+        "center_altitude_m",
+        data=array_meta["center_altitude_m"]
+    )
+    group.create_dataset(
+        "center_source",
+        data=array_meta["center_source"],
+        dtype=string_dtype
+    )
+    group.create_dataset(
+        "position_frame",
+        data=array_meta["position_frame"],
+        dtype=string_dtype
+    )
+    group.create_dataset(
+        "antenna_ids_used_for_center",
+        data=array_meta["antenna_ids_used_for_center"]
+    )
+    group.create_dataset(
+        "n_antenna_in_txt",
+        data=array_meta["n_antenna_in_txt"]
+    )
+    group.create_dataset(
+        "antenna_ids_used_in_input",
+        data=array_meta["antenna_ids_used_in_input"]
+    )
+    group.create_dataset(
+        "n_antenna_used_in_input",
+        data=array_meta["n_antenna_used_in_input"]
+    )
+    group.create_dataset(
+        "center_is_placeholder",
+        data=array_meta["center_is_placeholder"]
+    )
+
+    group.attrs["description"] = (
+        "Array-level observatory metadata for future MS export and CASA registration"
+    )
+    group.attrs["center_unit"] = "m"
+    group.attrs["lat_lon_unit"] = "degree"
+    group.attrs["altitude_unit"] = "m"
+
+    center_ids = [f"ant{int(antenna_id)}" for antenna_id in array_meta[
+        "antenna_ids_used_for_center"
+    ]]
+    input_ids = [f"ant{int(antenna_id)}" for antenna_id in array_meta[
+        "antenna_ids_used_in_input"
+    ]]
+
+    print("[OK] array name:", array_meta["name"])
+    print("[OK] array config name:", array_meta["config_name"])
+    print("[OK] array center source:", array_meta["center_source"])
+    print(
+        "[OK] array center lon/lat/alt:",
+        float(array_meta["center_longitude_deg"]),
+        float(array_meta["center_latitude_deg"]),
+        float(array_meta["center_altitude_m"])
+    )
+    print("[OK] array center ITRF m:", array_meta["center_itrf_m"])
+    print(
+        "[OK] antennas used for center:",
+        ", ".join(center_ids) if center_ids else "(none)"
+    )
+    print(
+        "[OK] antennas used in input:",
+        ", ".join(input_ids) if input_ids else "(none)"
+    )
 
 
 def write_field_group(h5, infos):
@@ -2429,6 +2880,7 @@ def validate_ms_ready_output(h5):
         "time",
         "frequency",
         "antenna",
+        "array",
         "field",
         "polarization",
         "ms_rows",
@@ -2465,6 +2917,19 @@ def validate_ms_ready_output(h5):
         "antenna/used_in_input",
         "antenna/position_is_placeholder_by_antenna",
         "antenna/position_is_placeholder",
+        "array/name",
+        "array/config_name",
+        "array/center_itrf_m",
+        "array/center_longitude_deg",
+        "array/center_latitude_deg",
+        "array/center_altitude_m",
+        "array/center_source",
+        "array/position_frame",
+        "array/antenna_ids_used_for_center",
+        "array/n_antenna_in_txt",
+        "array/antenna_ids_used_in_input",
+        "array/n_antenna_used_in_input",
+        "array/center_is_placeholder",
         "field/source_name",
         "field/phase_center_ra_rad",
         "field/phase_center_dec_rad",
@@ -2504,6 +2969,11 @@ def validate_ms_ready_output(h5):
         "ms_defaults/sigma_default",
         "ms_defaults/missing_signal_should_flag",
     ]
+    required_root_attrs = [
+        "observation_role_code",
+        "observation_role",
+        "ms_obs_mode",
+    ]
     forbidden_root_datasets = [
         "ANTENNA1",
         "ANTENNA2",
@@ -2519,6 +2989,27 @@ def validate_ms_ready_output(h5):
     for path in required_paths:
         if path not in h5:
             raise ValueError(f"missing required dataset: /{path}")
+
+    for attr_name in required_root_attrs:
+        if attr_name not in h5.attrs:
+            raise ValueError(f"missing required root attribute: {attr_name}")
+
+    observation_role_code = str(h5.attrs["observation_role_code"])
+    observation_role = str(h5.attrs["observation_role"])
+    ms_obs_mode = str(h5.attrs["ms_obs_mode"])
+    expected_observation_meta = get_observation_metadata(observation_role_code)
+
+    if observation_role != expected_observation_meta["role_name"]:
+        raise ValueError(
+            "observation_role mismatch: "
+            f"{observation_role} != {expected_observation_meta['role_name']}"
+        )
+
+    if ms_obs_mode != expected_observation_meta["ms_obs_mode"]:
+        raise ValueError(
+            "ms_obs_mode mismatch: "
+            f"{ms_obs_mode} != {expected_observation_meta['ms_obs_mode']}"
+        )
 
     for dataset_name in forbidden_root_datasets:
         if dataset_name in h5:
@@ -2590,6 +3081,90 @@ def validate_ms_ready_output(h5):
     if int(h5["field/is_placeholder"][()]) != 0:
         raise ValueError("field is still placeholder")
 
+    array_name = as_text(h5["array/name"][()]).strip()
+    array_config_name = as_text(h5["array/config_name"][()]).strip()
+    array_center_source = as_text(h5["array/center_source"][()]).strip()
+
+    if array_name != ARRAY_NAME:
+        raise ValueError(f"array/name mismatch: {array_name} != {ARRAY_NAME}")
+
+    if array_config_name != ARRAY_CONFIG_NAME:
+        raise ValueError(
+            f"array/config_name mismatch: {array_config_name} != {ARRAY_CONFIG_NAME}"
+        )
+
+    if array_center_source != ARRAY_CENTER_SOURCE:
+        raise ValueError(
+            "array/center_source mismatch: "
+            f"{array_center_source} != {ARRAY_CENTER_SOURCE}"
+        )
+
+    if h5["array/center_itrf_m"].shape != (3,):
+        raise ValueError("array/center_itrf_m shape mismatch")
+
+    array_center = h5["array/center_itrf_m"][()]
+    if not np.all(np.isfinite(array_center)):
+        raise ValueError("array center ITRF has non-finite values")
+
+    array_radius = float(np.linalg.norm(array_center))
+    if array_radius < 6000000.0 or array_radius > 7000000.0:
+        raise ValueError(
+            "array center ITRF radius does not look like Earth coordinate: "
+            f"{array_radius}"
+        )
+
+    if int(h5["array/center_is_placeholder"][()]) != 0:
+        raise ValueError("array center is still placeholder")
+
+    array_lon = float(h5["array/center_longitude_deg"][()])
+    array_lat = float(h5["array/center_latitude_deg"][()])
+    array_alt = float(h5["array/center_altitude_m"][()])
+
+    if not np.isfinite(array_lon) or not np.isfinite(array_lat) or not np.isfinite(array_alt):
+        raise ValueError("array lon/lat/alt has non-finite values")
+
+    if array_lat < -90.0 or array_lat > 90.0:
+        raise ValueError("array center latitude out of range")
+
+    if array_lon < -180.0 or array_lon > 360.0:
+        raise ValueError("array center longitude out of range")
+
+    n_antenna_in_txt = int(h5["array/n_antenna_in_txt"][()])
+    if n_antenna_in_txt <= 0:
+        raise ValueError("array/n_antenna_in_txt must be > 0")
+
+    expected_phase1_ids = np.array(PHASE1_ANTENNA_IDS, dtype=np.int16)
+    if n_antenna_in_txt != expected_phase1_ids.size:
+        raise ValueError(
+            "array/n_antenna_in_txt mismatch for CARRY_PHASE1: "
+            f"{n_antenna_in_txt} != {expected_phase1_ids.size}"
+        )
+
+    if h5["array/antenna_ids_used_for_center"].shape != (n_antenna_in_txt,):
+        raise ValueError("array/antenna_ids_used_for_center length mismatch")
+
+    if not np.array_equal(
+        h5["array/antenna_ids_used_for_center"][()],
+        expected_phase1_ids
+    ):
+        raise ValueError("array/antenna_ids_used_for_center must be [0,1,2,3]")
+
+    if not np.array_equal(h5["antenna/id"][()], expected_phase1_ids):
+        raise ValueError("antenna/id must be [0,1,2,3] for CARRY_PHASE1")
+
+    if h5["antenna/position_itrf_m"].shape != (expected_phase1_ids.size, 3):
+        raise ValueError("antenna/position_itrf_m must only contain ant0-ant3")
+
+    if int(h5["antenna/position_is_placeholder"][()]) != 0:
+        raise ValueError("antenna positions still contain placeholders")
+
+    if np.any(h5["antenna/position_is_placeholder_by_antenna"][()].astype(bool)):
+        raise ValueError("some antenna positions are still placeholders")
+
+    n_antenna_used_in_input = int(h5["array/n_antenna_used_in_input"][()])
+    if h5["array/antenna_ids_used_in_input"].shape != (n_antenna_used_in_input,):
+        raise ValueError("array/antenna_ids_used_in_input length mismatch")
+
     if "ms_rows/corr_name" not in h5:
         raise ValueError("missing ms_rows/corr_name")
 
@@ -2599,6 +3174,9 @@ def validate_ms_ready_output(h5):
     validate_uvw_result(h5)
 
     print("MS-ready HDF5 groups written:", ", ".join(required_groups))
+    print("observation role code:", observation_role_code)
+    print("observation role:", observation_role)
+    print("MS observation mode:", ms_obs_mode)
     print(
         "selected_baseline_count:",
         selected_baseline_count
@@ -2609,6 +3187,14 @@ def validate_ms_ready_output(h5):
         int(h5["antenna/position_is_placeholder"][()])
     )
     print("field placeholder:", int(h5["field/is_placeholder"][()]))
+    print("array name:", array_name)
+    print("array config name:", array_config_name)
+    print("array center ITRF m:", h5["array/center_itrf_m"][()])
+    print("array center lon deg:", array_lon)
+    print("array center lat deg:", array_lat)
+    print("array center alt m:", array_alt)
+    print("array center source:", array_center_source)
+    print("array n antenna in txt:", n_antenna_in_txt)
     print("uvw placeholder:", int(h5["uvw/is_placeholder"][()]))
     print("UVW method:", h5["uvw"].attrs["method"])
     print("UVW placeholder:", int(h5["uvw/is_placeholder"][()]))
@@ -2649,6 +3235,7 @@ def write_ms_ready_metadata(h5, infos, signal_map, baseline_pairs):
     write_time_group(h5, infos)
     write_frequency_group(h5, infos)
     write_antenna_group(h5, signal_map)
+    write_array_group(h5, signal_map)
     write_field_group(h5, infos)
     write_polarization_group(h5)
     write_ms_rows_group(h5, ms_row_map, row_has_missing_signal)
@@ -2656,7 +3243,13 @@ def write_ms_ready_metadata(h5, infos, signal_map, baseline_pairs):
     write_ms_defaults_group(h5)
 
 
-def create_hdf5_file(output_file, infos, signal_map, baseline_pairs):
+def create_hdf5_file(
+    output_file,
+    infos,
+    signal_map,
+    baseline_pairs,
+    observation_meta
+):
     if h5py is None:
         raise RuntimeError(
             f"h5py is unavailable, cannot save HDF5 output: {H5PY_IMPORT_ERROR}"
@@ -2696,7 +3289,13 @@ def create_hdf5_file(output_file, infos, signal_map, baseline_pairs):
     )
 
     write_signal_metadata(h5, signal_map)
-    write_global_metadata(h5, infos, n_corr_time, n_baseline)
+    write_global_metadata(
+        h5,
+        infos,
+        n_corr_time,
+        n_baseline,
+        observation_meta
+    )
     write_ms_ready_metadata(h5, infos, signal_map, baseline_pairs)
     validate_ms_ready_output(h5)
 
@@ -2706,7 +3305,12 @@ def create_hdf5_file(output_file, infos, signal_map, baseline_pairs):
 # =========================
 # 说明：无需修改其它部分
 # =========================
-def run_correlation_and_save(infos, signal_map, baseline_pairs):
+def run_correlation_and_save(
+    infos,
+    signal_map,
+    baseline_pairs,
+    observation_meta
+):
     """
     相关计算 + 可选HDF5保存的总调度函数。
 
@@ -2717,11 +3321,22 @@ def run_correlation_and_save(infos, signal_map, baseline_pairs):
         只读取数据、计算相关、不写入HDF5
         这种模式适合存储空间不足时测试流程
     """
-    output_file = get_output_hdf5_file(infos)
+    output_file = get_output_hdf5_file(
+        infos,
+        observation_meta
+    )
+    validate_output_filename_role(
+        output_file,
+        observation_meta
+    )
 
     print("\n========== START CORRELATION ==========")
     print("HDF5 output enabled:", ENABLE_HDF5_OUTPUT)
     print("corr output mode   :", CORR_OUTPUT_MODE)
+    print("observation role code:", observation_meta["role_code"])
+    print("output filename role :", f"_{observation_meta['role_code']}")
+    print("observation role   :", observation_meta["role_name"])
+    print("MS OBS_MODE        :", observation_meta["ms_obs_mode"])
 
     if ENABLE_HDF5_OUTPUT:
         print("output file:", output_file)
@@ -2729,7 +3344,8 @@ def run_correlation_and_save(infos, signal_map, baseline_pairs):
             output_file,
             infos,
             signal_map,
-            baseline_pairs
+            baseline_pairs,
+            observation_meta
         )
     else:
         print("output file: disabled")
@@ -2809,6 +3425,8 @@ def run_correlation_and_save(infos, signal_map, baseline_pairs):
     print("\n========== CORRELATION FINISHED ==========")
     print("HDF5 output enabled:", ENABLE_HDF5_OUTPUT)
     print("corr output mode   :", CORR_OUTPUT_MODE)
+    print("observation role   :", observation_meta["role_name"])
+    print("MS OBS_MODE        :", observation_meta["ms_obs_mode"])
 
     if ENABLE_HDF5_OUTPUT:
         print("output file:", output_file)
@@ -2845,6 +3463,39 @@ def parse_command_line(argv):
         ),
     )
     parser.add_argument(
+        "-type",
+        "--obs-type",
+        dest="obs_type",
+        required=True,
+        type=str.lower,
+        choices=sorted(OBSERVATION_ROLE_MAP.keys()),
+        help=(
+            "observation role of this HDF5: "
+            "cal=calibrator, tar=target"
+        ),
+    )
+    parser.add_argument(
+        "-field",
+        "--field",
+        dest="field",
+        default=None,
+        metavar='"RA_HMS DEC_DMS"',
+        help=(
+            "override phase center field coordinates, for example: "
+            '-field "19:35:00.00 21:54:00.00"'
+        ),
+    )
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        dest="output_dir",
+        default=OUTPUT_HDF5_DIR,
+        help=(
+            "output directory for the generated HDF5 file. "
+            "The filename is still generated automatically from time and -type."
+        ),
+    )
+    parser.add_argument(
         "files",
         nargs="+",
         help="input filterbank .fil files"
@@ -2855,10 +3506,25 @@ def parse_command_line(argv):
 
 def main():
 
-    global ANTENNA_INFO_TXT
+    global ANTENNA_INFO_TXT, OUTPUT_HDF5_DIR
     args = parse_command_line(sys.argv[1:])
     files = args.files
     ANTENNA_INFO_TXT = args.antenna_txt
+    OUTPUT_HDF5_DIR = args.output_dir
+    apply_field_argument(args.field)
+    observation_meta = get_observation_metadata(args.obs_type)
+
+    print("\n========== OBSERVATION ROLE ==========")
+    print("role code   :", observation_meta["role_code"])
+    print("role name   :", observation_meta["role_name"])
+    print("MS OBS_MODE :", observation_meta["ms_obs_mode"])
+    print("======================================")
+
+    print("\n========== FIELD PHASE CENTER ==========")
+    print("RA HMS      :", FIELD_RA_HMS)
+    print("Dec DMS     :", FIELD_DEC_DMS)
+    print("frame       :", FIELD_FRAME)
+    print("========================================")
 
     try:
         check_file_count(files)
@@ -2905,7 +3571,12 @@ def main():
         print("\n[OK] PREPARE LAYER FINISHED")
 
         # 8. 第三部分相关计算 + 第四部分HDF5保存
-        run_correlation_and_save(infos, signal_map, baseline_pairs)
+        run_correlation_and_save(
+            infos,
+            signal_map,
+            baseline_pairs,
+            observation_meta
+        )
 
     except Exception as e:
         print("\n[ERROR]")

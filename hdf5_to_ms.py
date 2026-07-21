@@ -6,6 +6,7 @@ Convert an MS-ready HDF5 file into a CASA MeasurementSet.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import inspect
 import os
 import platform
@@ -20,6 +21,33 @@ if not hasattr(np, "typeDict"):
     np.typeDict = np.sctypeDict
 if not hasattr(np, "asscalar"):
     np.asscalar = lambda value: np.asarray(value).item()
+if not hasattr(np, "alen"):
+    np.alen = lambda value: len(value)
+for _np_alias, _np_value in {
+    "bool": bool,
+    "int": int,
+    "float": float,
+    "complex": complex,
+    "object": object,
+    "str": str,
+    "unicode": str,
+}.items():
+    if _np_alias not in np.__dict__:
+        setattr(np, _np_alias, _np_value)
+
+from astropy.utils import iers
+
+IERS_FILE = "/home/wangzhao/carry_image/finals2000A.all"
+IERS_LOAD_ERROR = None
+
+iers.conf.auto_download = False
+try:
+    if not os.path.isfile(IERS_FILE):
+        raise FileNotFoundError(IERS_FILE)
+    iers_table = iers.IERS_A.open(IERS_FILE)
+    iers.earth_orientation_table.set(iers_table)
+except Exception as error:
+    IERS_LOAD_ERROR = error
 
 try:
     import h5py
@@ -65,20 +93,25 @@ else:
     ASTROPY_IMPORT_ERROR = None
 
 # =========================
-# CASA telescope / array names
+# CASA telescope fallback name
 # =========================
 #
-# CASA_TELESCOPE_NAME is written into:
+# Authoritative name source:
 #
-#     MS/OBSERVATION/TELESCOPE_NAME
+#     HDF5 /array/name
 #
-# CASA 5.x listobs checks this name against CASA's known observatory table.
-# The user has registered CARRY_1 in CASA, so use CARRY_1 here.
+# This name is used for:
 #
-# ARRAY_NAME and INSTRUMENT_NAME record the local array identity.
-CASA_TELESCOPE_NAME = "CARRY_1"
-ARRAY_NAME = "CARRY_1"
-INSTRUMENT_NAME = "CARRY_1"
+#     pyuvdata telescope_name
+#     pyuvdata instrument
+#     MS OBSERVATION/TELESCOPE_NAME
+#
+# The default below is kept only as a defensive fallback for internal/debug
+# payloads. Production HDF5 inputs must provide /array/name.
+DEFAULT_CASA_TELESCOPE_NAME = "CARRY_PHASE1"
+CARRY_PHASE1_NAME = "CARRY_PHASE1"
+CARRY_PHASE1_CENTER_SOURCE = "mean_of_phase1_antennas"
+CARRY_PHASE1_ANTENNA_IDS = np.array([0, 1, 2, 3], dtype=np.int64)
 
 # Keep the in-memory DATA polarization axis in the same order that
 # CASA MeasurementSet POLARIZATION/CORR_TYPE will advertise.
@@ -114,6 +147,18 @@ REQUIRED_PATHS = [
     "antenna/dish_diameter_m",
     "antenna/used_in_input",
     "antenna/position_is_placeholder_by_antenna",
+    "array/name",
+    "array/center_itrf_m",
+    "array/center_longitude_deg",
+    "array/center_latitude_deg",
+    "array/center_altitude_m",
+    "array/center_source",
+    "array/position_frame",
+    "array/antenna_ids_used_for_center",
+    "array/n_antenna_in_txt",
+    "array/antenna_ids_used_in_input",
+    "array/n_antenna_used_in_input",
+    "array/center_is_placeholder",
     "field/source_name",
     "field/phase_center_ra_rad",
     "field/phase_center_dec_rad",
@@ -134,6 +179,17 @@ REQUIRED_PATHS = [
     "uvw/uvw_m",
     "uvw/is_placeholder",
 ]
+REQUIRED_ROOT_ATTRS = [
+    "observation_role_code",
+    "observation_role",
+    "ms_obs_mode",
+    "data_start_unix_ns",
+    "data_end_unix_ns",
+]
+OBSERVATION_ROLE_ORDER = {
+    "cal": 0,
+    "tar": 1,
+}
 
 
 def require_h5py() -> None:
@@ -184,6 +240,162 @@ def read_text_scalar(h5: h5py.File, path: str) -> str:
 
 def decode_string_array(array: np.ndarray) -> list[str]:
     return [as_text(item) for item in array]
+
+
+def read_array_metadata(h5: h5py.File) -> dict[str, Any]:
+    array_name = read_text_scalar(h5, "array/name").strip()
+    if "array/config_name" in h5:
+        array_config_name = read_text_scalar(h5, "array/config_name").strip()
+    else:
+        array_config_name = array_name
+    center_itrf_m = np.asarray(
+        h5["array/center_itrf_m"][()],
+        dtype=np.float64,
+    )
+    center_longitude_deg = float(read_scalar(h5, "array/center_longitude_deg"))
+    center_latitude_deg = float(read_scalar(h5, "array/center_latitude_deg"))
+    center_altitude_m = float(read_scalar(h5, "array/center_altitude_m"))
+    center_source = read_text_scalar(h5, "array/center_source").strip()
+    position_frame = read_text_scalar(h5, "array/position_frame").strip()
+    center_is_placeholder = int(read_scalar(h5, "array/center_is_placeholder"))
+    antenna_ids_used_for_center = np.asarray(
+        h5["array/antenna_ids_used_for_center"][()],
+        dtype=np.int64,
+    )
+    antenna_ids_used_in_input = np.asarray(
+        h5["array/antenna_ids_used_in_input"][()],
+        dtype=np.int64,
+    )
+    n_antenna_in_txt = int(read_scalar(h5, "array/n_antenna_in_txt"))
+    n_antenna_used_in_input = int(read_scalar(h5, "array/n_antenna_used_in_input"))
+
+    return {
+        "array_name": array_name,
+        "array_config_name": array_config_name,
+        "array_center_itrf_m": center_itrf_m,
+        "array_center_longitude_deg": center_longitude_deg,
+        "array_center_latitude_deg": center_latitude_deg,
+        "array_center_altitude_m": center_altitude_m,
+        "array_center_source": center_source,
+        "array_position_frame": position_frame,
+        "array_center_is_placeholder": center_is_placeholder,
+        "array_antenna_ids_used_for_center": antenna_ids_used_for_center,
+        "array_antenna_ids_used_in_input": antenna_ids_used_in_input,
+        "array_n_antenna_in_txt": n_antenna_in_txt,
+        "array_n_antenna_used_in_input": n_antenna_used_in_input,
+    }
+
+
+def validate_array_metadata(
+    array_meta: dict[str, Any],
+    file_path: str = "<unknown>",
+) -> None:
+    array_name = str(array_meta["array_name"]).strip()
+    if array_name == "":
+        raise ValueError(f"empty /array/name in {file_path}")
+
+    array_config_name = str(array_meta.get("array_config_name", array_name)).strip()
+    if array_config_name == "":
+        raise ValueError(f"empty /array/config_name in {file_path}")
+
+    center = np.asarray(array_meta["array_center_itrf_m"], dtype=np.float64)
+    if center.shape != (3,):
+        raise ValueError(
+            f"/array/center_itrf_m shape mismatch in {file_path}: "
+            f"{center.shape} != (3,)"
+        )
+
+    if not np.all(np.isfinite(center)):
+        raise ValueError(
+            f"/array/center_itrf_m contains non-finite values in {file_path}"
+        )
+
+    radius = float(np.linalg.norm(center))
+    if radius < 6000000.0 or radius > 7000000.0:
+        raise ValueError(
+            "/array/center_itrf_m radius does not look like Earth coordinate "
+            f"in {file_path}: {radius}"
+        )
+
+    if int(array_meta["array_center_is_placeholder"]) != 0:
+        raise ValueError(f"/array/center_is_placeholder is not zero in {file_path}")
+
+    lon = float(array_meta["array_center_longitude_deg"])
+    lat = float(array_meta["array_center_latitude_deg"])
+    alt = float(array_meta["array_center_altitude_m"])
+
+    if not np.isfinite(lon) or not np.isfinite(lat) or not np.isfinite(alt):
+        raise ValueError(f"/array lon/lat/alt contains non-finite values in {file_path}")
+
+    if lat < -90.0 or lat > 90.0:
+        raise ValueError(f"/array center latitude out of range in {file_path}: {lat}")
+
+    if lon < -180.0 or lon > 360.0:
+        raise ValueError(f"/array center longitude out of range in {file_path}: {lon}")
+
+    n_center = int(array_meta["array_n_antenna_in_txt"])
+    ids_center = np.asarray(
+        array_meta["array_antenna_ids_used_for_center"],
+        dtype=np.int64,
+    )
+
+    if n_center <= 0:
+        raise ValueError(f"/array/n_antenna_in_txt must be > 0 in {file_path}")
+
+    if ids_center.shape != (n_center,):
+        raise ValueError(
+            f"/array/antenna_ids_used_for_center length mismatch in {file_path}"
+        )
+
+    n_used = int(array_meta["array_n_antenna_used_in_input"])
+    ids_used = np.asarray(
+        array_meta["array_antenna_ids_used_in_input"],
+        dtype=np.int64,
+    )
+
+    if n_used < 0:
+        raise ValueError(
+            f"/array/n_antenna_used_in_input is negative in {file_path}"
+        )
+
+    if ids_used.shape != (n_used,):
+        raise ValueError(
+            f"/array/antenna_ids_used_in_input length mismatch in {file_path}"
+        )
+
+    position_frame = str(array_meta["array_position_frame"]).strip()
+    if position_frame == "":
+        raise ValueError(f"empty /array/position_frame in {file_path}")
+
+    is_phase1 = (
+        array_name == CARRY_PHASE1_NAME
+        or array_config_name == CARRY_PHASE1_NAME
+    )
+    if is_phase1:
+        if array_name != CARRY_PHASE1_NAME:
+            raise ValueError(
+                f"/array/name must be {CARRY_PHASE1_NAME} in {file_path}"
+            )
+        if array_config_name != CARRY_PHASE1_NAME:
+            raise ValueError(
+                f"/array/config_name must be {CARRY_PHASE1_NAME} in {file_path}"
+            )
+        if str(array_meta["array_center_source"]).strip() != CARRY_PHASE1_CENTER_SOURCE:
+            raise ValueError(
+                "/array/center_source mismatch for CARRY_PHASE1 in "
+                f"{file_path}: {array_meta['array_center_source']} "
+                f"!= {CARRY_PHASE1_CENTER_SOURCE}"
+            )
+        if not np.array_equal(ids_center, CARRY_PHASE1_ANTENNA_IDS):
+            raise ValueError(
+                "/array/antenna_ids_used_for_center must be [0,1,2,3] "
+                f"for CARRY_PHASE1 in {file_path}"
+            )
+        if not np.array_equal(ids_used, CARRY_PHASE1_ANTENNA_IDS):
+            raise ValueError(
+                "/array/antenna_ids_used_in_input must be [0,1,2,3] "
+                f"for CARRY_PHASE1 in {file_path}"
+            )
 
 
 def format_bytes(n_bytes: int) -> str:
@@ -271,14 +483,107 @@ def ensure_required_paths(h5: h5py.File) -> None:
             raise ValueError(f"missing required HDF5 path: /{path}")
 
 
+def is_carry_phase1_array(array_meta: dict[str, Any]) -> bool:
+    array_name = str(array_meta.get("array_name", "")).strip()
+    array_config_name = str(
+        array_meta.get("array_config_name", array_name)
+    ).strip()
+    return array_name == CARRY_PHASE1_NAME or array_config_name == CARRY_PHASE1_NAME
+
+
+def validate_hdf5_antenna_signal_metadata(
+    h5: h5py.File,
+    array_meta: dict[str, Any],
+) -> None:
+    antenna_ids = np.asarray(h5["antenna/id"][()], dtype=np.int64)
+    antenna_positions = np.asarray(
+        h5["antenna/position_itrf_m"][()],
+        dtype=np.float64,
+    )
+    antenna_used = np.asarray(h5["antenna/used_in_input"][()], dtype=bool)
+    antenna_placeholder = np.asarray(
+        h5["antenna/position_is_placeholder_by_antenna"][()],
+        dtype=bool,
+    )
+    signal_present = np.asarray(h5["signal/present"][()], dtype=bool)
+    signal_ant_ids = np.asarray(h5["signal/antenna_id"][()], dtype=np.int64)
+    used_from_signal = set(int(item) for item in signal_ant_ids[signal_present])
+    known_antenna_ids = set(int(item) for item in antenna_ids)
+    missing_from_antenna = sorted(used_from_signal - known_antenna_ids)
+
+    if missing_from_antenna:
+        raise ValueError(
+            "signal/present references antennas missing from /antenna/id: "
+            + ", ".join([f"ant{item}" for item in missing_from_antenna])
+        )
+
+    if antenna_positions.shape != (antenna_ids.size, 3):
+        raise ValueError(
+            "/antenna/position_itrf_m shape mismatch: "
+            f"{antenna_positions.shape} != {(antenna_ids.size, 3)}"
+        )
+
+    if antenna_used.shape != antenna_ids.shape:
+        raise ValueError("/antenna/used_in_input length mismatch")
+
+    if antenna_placeholder.shape != antenna_ids.shape:
+        raise ValueError("/antenna/position_is_placeholder_by_antenna length mismatch")
+
+    if np.any(antenna_used & antenna_placeholder):
+        bad = antenna_ids[antenna_used & antenna_placeholder]
+        raise ValueError(
+            "used antennas still have placeholder positions: "
+            + ", ".join([f"ant{int(item)}" for item in bad])
+        )
+
+    if is_carry_phase1_array(array_meta):
+        if not np.array_equal(antenna_ids, CARRY_PHASE1_ANTENNA_IDS):
+            raise ValueError(
+                "/antenna/id must be [0,1,2,3] for CARRY_PHASE1; "
+                f"got {antenna_ids.tolist()}"
+            )
+
+        if np.any(antenna_placeholder):
+            raise ValueError(
+                "CARRY_PHASE1 /antenna must not contain placeholder positions"
+            )
+
+        if not np.array_equal(
+            np.asarray(sorted(used_from_signal), dtype=np.int64),
+            CARRY_PHASE1_ANTENNA_IDS,
+        ):
+            raise ValueError(
+                "CARRY_PHASE1 signal/present must use exactly ant0-ant3; "
+                f"got {sorted(used_from_signal)}"
+            )
+
+
 def validate_hdf5_input(h5: h5py.File) -> None:
     ensure_required_paths(h5)
+
+    for attr_name in REQUIRED_ROOT_ATTRS:
+        if attr_name not in h5.attrs:
+            raise ValueError(f"missing required HDF5 root attribute: {attr_name}")
+
+    role_code = as_text(h5.attrs["observation_role_code"]).strip().lower()
+    if role_code not in OBSERVATION_ROLE_ORDER:
+        raise ValueError(
+            f"unsupported observation_role_code: {role_code}; "
+            "expected cal or tar"
+        )
+
+    if as_text(h5.attrs["ms_obs_mode"]).strip() == "":
+        raise ValueError("empty HDF5 root attribute: ms_obs_mode")
 
     if int(read_scalar(h5, "field/is_placeholder")) != 0:
         raise ValueError("/field is still placeholder")
 
     if int(read_scalar(h5, "uvw/is_placeholder")) != 0:
         raise ValueError("/uvw is still placeholder")
+
+    array_meta = read_array_metadata(h5)
+    validate_array_metadata(array_meta, file_path=h5.filename)
+    validate_hdf5_antenna_signal_metadata(h5, array_meta)
 
     ra_rad = float(read_scalar(h5, "field/phase_center_ra_rad"))
     dec_rad = float(read_scalar(h5, "field/phase_center_dec_rad"))
@@ -360,6 +665,373 @@ def validate_hdf5_input(h5: h5py.File) -> None:
             raise ValueError("cross-antenna UVW is all zero")
 
 
+def load_hdf5_metadata(file_path: str) -> dict[str, Any]:
+    """
+    Load file-level metadata needed for multi-HDF5 ordering and global tables.
+
+    The observation role is read from HDF5 root attributes, not inferred from
+    the filename.
+    """
+    require_h5py()
+
+    with h5py.File(file_path, "r") as h5:
+        validate_hdf5_input(h5)
+
+        source_name = read_text_scalar(h5, "field/source_name").strip()
+        if source_name == "":
+            source_name = "PhaseCenter"
+
+        role_code = as_text(h5.attrs["observation_role_code"]).strip().lower()
+        observation_role = as_text(h5.attrs["observation_role"]).strip()
+        ms_obs_mode = as_text(h5.attrs["ms_obs_mode"]).strip()
+        frame = read_text_scalar(h5, "field/frame").strip().upper()
+        ra_rad = float(read_scalar(h5, "field/phase_center_ra_rad"))
+        dec_rad = float(read_scalar(h5, "field/phase_center_dec_rad"))
+        data_start_unix_ns = int(h5.attrs["data_start_unix_ns"])
+        data_end_unix_ns = int(h5.attrs["data_end_unix_ns"])
+        freq_array_hz = np.asarray(
+            h5["frequency/chan_freq_hz"][()],
+            dtype=np.float64,
+        )
+        channel_width_hz = np.asarray(
+            h5["frequency/chan_width_hz"][()],
+            dtype=np.float64,
+        )
+
+        if "polarization/all_corr_names" in h5:
+            corr_names = decode_string_array(h5["polarization/all_corr_names"][()])
+        else:
+            corr_names = POL_ORDER.copy()
+
+        antenna_ids = np.asarray(h5["antenna/id"][()], dtype=np.int64)
+        antenna_names = np.array(
+            decode_string_array(h5["antenna/name"][()]),
+            dtype=object,
+        )
+        antenna_stations = np.array(
+            decode_string_array(h5["antenna/station"][()]),
+            dtype=object,
+        )
+        antenna_positions = np.asarray(
+            h5["antenna/position_itrf_m"][()],
+            dtype=np.float64,
+        )
+        antenna_diameters = np.asarray(
+            h5["antenna/dish_diameter_m"][()],
+            dtype=np.float64,
+        )
+        array_meta = read_array_metadata(h5)
+        validate_array_metadata(array_meta, file_path=file_path)
+
+        if data_end_unix_ns <= data_start_unix_ns:
+            raise ValueError(
+                f"bad HDF5 time range for {file_path}: "
+                f"{data_start_unix_ns} -> {data_end_unix_ns}"
+            )
+
+        field_key = (
+            source_name,
+            ra_rad,
+            dec_rad,
+            frame,
+        )
+
+        return {
+            "file": str(file_path),
+            "role_code": role_code,
+            "observation_role": observation_role,
+            "ms_obs_mode": ms_obs_mode,
+            "data_start_unix_ns": data_start_unix_ns,
+            "data_end_unix_ns": data_end_unix_ns,
+            "source_name": source_name,
+            "phase_center_ra_rad": ra_rad,
+            "phase_center_dec_rad": dec_rad,
+            "field_frame": frame,
+            "field_key": field_key,
+            "freq_array_hz": freq_array_hz,
+            "channel_width_hz": channel_width_hz,
+            "corr_names": corr_names,
+            "antenna_ids": antenna_ids,
+            "antenna_names": antenna_names,
+            "antenna_stations": antenna_stations,
+            "antenna_positions_itrf_m": antenna_positions,
+            "antenna_dish_diameter_m": antenna_diameters,
+            "array_name": array_meta["array_name"],
+            "array_config_name": array_meta["array_config_name"],
+            "array_center_itrf_m": array_meta["array_center_itrf_m"],
+            "array_center_longitude_deg": array_meta["array_center_longitude_deg"],
+            "array_center_latitude_deg": array_meta["array_center_latitude_deg"],
+            "array_center_altitude_m": array_meta["array_center_altitude_m"],
+            "array_center_source": array_meta["array_center_source"],
+            "array_position_frame": array_meta["array_position_frame"],
+            "array_antenna_ids_used_for_center": array_meta[
+                "array_antenna_ids_used_for_center"
+            ],
+            "array_n_antenna_in_txt": array_meta["array_n_antenna_in_txt"],
+        }
+
+
+def sort_hdf5_inputs(infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Sort HDF5 inputs by observation role, then by start time.
+
+    Calibrator files are placed before target files. Within each role, files are
+    sorted by data_start_unix_ns.
+    """
+    return sorted(
+        infos,
+        key=lambda info: (
+            OBSERVATION_ROLE_ORDER[info["role_code"]],
+            int(info["data_start_unix_ns"]),
+            info["file"],
+        ),
+    )
+
+
+def build_global_field_table(infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Build the global FIELD table from sorted HDF5 inputs.
+
+    FIELD identity is source_name + phase center + frame, not cal/tar role.
+    """
+    field_table: list[dict[str, Any]] = []
+    field_id_by_key: dict[tuple[Any, ...], int] = {}
+
+    for info in infos:
+        key = info["field_key"]
+        field_id = field_id_by_key.get(key)
+
+        if field_id is None:
+            field_id = len(field_table)
+            field_id_by_key[key] = field_id
+            field_table.append(
+                {
+                    "field_id": field_id,
+                    "source_name": info["source_name"],
+                    "phase_center_ra_rad": float(info["phase_center_ra_rad"]),
+                    "phase_center_dec_rad": float(info["phase_center_dec_rad"]),
+                    "frame": info["field_frame"],
+                }
+            )
+
+        info["field_id"] = field_id
+
+    return field_table
+
+
+def build_global_state_table(infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Build the global STATE table from ms_obs_mode.
+
+    Identical OBS_MODE strings share one STATE_ID.
+    """
+    state_table: list[dict[str, Any]] = []
+    state_id_by_obs_mode: dict[str, int] = {}
+
+    for info in infos:
+        obs_mode = info["ms_obs_mode"]
+        state_id = state_id_by_obs_mode.get(obs_mode)
+
+        if state_id is None:
+            state_id = len(state_table)
+            state_id_by_obs_mode[obs_mode] = state_id
+            state_table.append(
+                {
+                    "state_id": state_id,
+                    "obs_mode": obs_mode,
+                }
+            )
+
+        info["state_id"] = state_id
+
+    return state_table
+
+
+def assign_scan_numbers(infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Assign one global SCAN_NUMBER per sorted HDF5 input.
+    """
+    scan_table: list[dict[str, Any]] = []
+
+    for scan_number, info in enumerate(infos, start=1):
+        info["scan_number"] = scan_number
+        scan_table.append(
+            {
+                "scan_number": scan_number,
+                "file": info["file"],
+                "source_name": info["source_name"],
+                "role_code": info["role_code"],
+                "field_id": int(info["field_id"]),
+                "state_id": int(info["state_id"]),
+                "data_start_unix_ns": int(info["data_start_unix_ns"]),
+                "data_end_unix_ns": int(info["data_end_unix_ns"]),
+            }
+        )
+
+    return scan_table
+
+
+def build_phase_center_catalog_from_field_table(
+    field_table: list[dict[str, Any]]
+) -> dict[int, dict[str, Any]]:
+    catalog: dict[int, dict[str, Any]] = {}
+
+    for field in field_table:
+        field_id = int(field["field_id"])
+        frame_text = str(field["frame"]).strip().upper()
+        entry = {
+            "cat_name": field["source_name"],
+            "cat_type": "sidereal",
+            "cat_lon": float(field["phase_center_ra_rad"]),
+            "cat_lat": float(field["phase_center_dec_rad"]),
+        }
+
+        if frame_text in ["J2000", "FK5"]:
+            entry["cat_frame"] = "fk5"
+            entry["cat_epoch"] = 2000.0
+        elif frame_text == "ICRS":
+            entry["cat_frame"] = "icrs"
+        else:
+            raise ValueError(f"unsupported field/frame for MS export: {frame_text}")
+
+        catalog[field_id] = entry
+
+    return catalog
+
+
+def validate_multi_hdf5_compatibility(infos: list[dict[str, Any]]) -> None:
+    """
+    Check compatibility required for a single-SPW, single-POL MS export.
+    """
+    if len(infos) == 0:
+        raise ValueError("no HDF5 inputs")
+
+    ref = infos[0]
+    ref_freq = ref["freq_array_hz"]
+    ref_width = ref["channel_width_hz"]
+    ref_corr_names = list(ref["corr_names"])
+    ref_array_name = str(ref["array_name"])
+    ref_array_config_name = str(ref.get("array_config_name", ref_array_name))
+    ref_array_center = np.asarray(ref["array_center_itrf_m"], dtype=np.float64)
+    ref_array_frame = str(ref["array_position_frame"])
+    ref_center_ids = np.asarray(
+        ref["array_antenna_ids_used_for_center"],
+        dtype=np.int64,
+    )
+
+    if ref_corr_names != POL_ORDER:
+        raise ValueError(
+            f"unsupported polarization order in {ref['file']}: "
+            f"{ref_corr_names} != {POL_ORDER}"
+        )
+
+    for info in infos:
+        if info["role_code"] not in OBSERVATION_ROLE_ORDER:
+            raise ValueError(
+                f"unsupported observation role in {info['file']}: "
+                f"{info['role_code']}"
+            )
+
+        if not np.array_equal(info["freq_array_hz"], ref_freq):
+            raise ValueError(
+                "frequency/chan_freq_hz mismatch between HDF5 inputs: "
+                f"{info['file']} != {ref['file']}"
+            )
+
+        if not np.array_equal(info["channel_width_hz"], ref_width):
+            raise ValueError(
+                "frequency/chan_width_hz mismatch between HDF5 inputs: "
+                f"{info['file']} != {ref['file']}"
+            )
+
+        if list(info["corr_names"]) != POL_ORDER:
+            raise ValueError(
+                f"unsupported polarization order in {info['file']}: "
+                f"{list(info['corr_names'])} != {POL_ORDER}"
+            )
+
+        for key in [
+            "antenna_ids",
+            "antenna_names",
+            "antenna_stations",
+            "antenna_positions_itrf_m",
+            "antenna_dish_diameter_m",
+        ]:
+            left = np.asarray(info[key])
+            right = np.asarray(ref[key])
+            if left.shape != right.shape:
+                raise ValueError(
+                    f"antenna metadata shape mismatch for {key}: "
+                    f"{info['file']} != {ref['file']}"
+                )
+            if left.dtype.kind in ["U", "S", "O"] or right.dtype.kind in ["U", "S", "O"]:
+                if not np.array_equal(left.astype(str), right.astype(str)):
+                    raise ValueError(
+                        f"antenna metadata mismatch for {key}: "
+                        f"{info['file']} != {ref['file']}"
+                    )
+            elif not np.allclose(left, right, rtol=0.0, atol=1e-6):
+                raise ValueError(
+                    f"antenna metadata mismatch for {key}: "
+                    f"{info['file']} != {ref['file']}"
+                )
+
+        if str(info["array_name"]) != ref_array_name:
+            raise ValueError(
+                "array/name mismatch between HDF5 inputs: "
+                f"{info['file']} != {ref['file']}"
+            )
+
+        info_array_config_name = str(
+            info.get("array_config_name", info["array_name"])
+        )
+        if info_array_config_name != ref_array_config_name:
+            raise ValueError(
+                "array/config_name mismatch between HDF5 inputs: "
+                f"{info['file']} != {ref['file']}"
+            )
+
+        if str(info["array_position_frame"]) != ref_array_frame:
+            raise ValueError(
+                "array/position_frame mismatch between HDF5 inputs: "
+                f"{info['file']} != {ref['file']}"
+            )
+
+        if not np.allclose(
+            np.asarray(info["array_center_itrf_m"], dtype=np.float64),
+            ref_array_center,
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise ValueError(
+                "array/center_itrf_m mismatch between HDF5 inputs: "
+                f"{info['file']} != {ref['file']}"
+            )
+
+        if not np.array_equal(
+            np.asarray(info["array_antenna_ids_used_for_center"], dtype=np.int64),
+            ref_center_ids,
+        ):
+            raise ValueError(
+                "array/antenna_ids_used_for_center mismatch between HDF5 inputs: "
+                f"{info['file']} != {ref['file']}"
+            )
+
+
+def print_hdf5_input_order(infos: list[dict[str, Any]]) -> None:
+    print("\n========== HDF5 INPUT ORDER ==========")
+    for info in infos:
+        print(
+            f"scan {int(info['scan_number'])}: "
+            f"role={info['role_code']} "
+            f"field_id={int(info['field_id'])} "
+            f"state_id={int(info['state_id'])} "
+            f"start_ns={int(info['data_start_unix_ns'])} "
+            f"file={info['file']}"
+        )
+    print("======================================")
+
+
 def build_baseline_pair_lookup(signal_pairs: np.ndarray) -> dict[tuple[int, int], int]:
     lookup: dict[tuple[int, int], int] = {}
 
@@ -398,6 +1070,9 @@ def get_visibility_for_signal_pair(
 
 
 def build_used_antenna_metadata(h5: h5py.File) -> dict[str, Any]:
+    array_meta = read_array_metadata(h5)
+    validate_array_metadata(array_meta, file_path=h5.filename)
+
     antenna_ids = np.asarray(h5["antenna/id"][()], dtype=np.int64)
     antenna_names = decode_string_array(h5["antenna/name"][()])
     station_names = decode_string_array(h5["antenna/station"][()])
@@ -420,6 +1095,14 @@ def build_used_antenna_metadata(h5: h5py.File) -> dict[str, Any]:
     used_from_antenna = set(
         int(item) for item in antenna_ids[used_mask_from_antenna]
     )
+    known_antenna_ids = set(int(item) for item in antenna_ids)
+    missing_from_antenna = sorted(used_from_signal - known_antenna_ids)
+
+    if missing_from_antenna:
+        raise ValueError(
+            "signal/present references antennas missing from /antenna/id: "
+            + ", ".join([f"ant{item}" for item in missing_from_antenna])
+        )
 
     if used_from_signal != used_from_antenna:
         warn(
@@ -449,8 +1132,29 @@ def build_used_antenna_metadata(h5: h5py.File) -> dict[str, Any]:
     if used_ids.size == 0:
         raise ValueError("no used antennas found in HDF5")
 
-    array_center = np.mean(used_positions_abs, axis=0)
+    if used_positions_abs.ndim != 2 or used_positions_abs.shape[1] != 3:
+        raise ValueError(
+            f"used antenna absolute position shape mismatch: {used_positions_abs.shape}"
+        )
+
+    if not np.all(np.isfinite(used_positions_abs)):
+        raise ValueError("used antenna absolute positions contain non-finite values")
+
+    array_center = np.asarray(
+        array_meta["array_center_itrf_m"],
+        dtype=np.float64,
+    )
     used_positions_rel = used_positions_abs - array_center
+
+    if not np.all(np.isfinite(used_positions_rel)):
+        raise ValueError("used antenna relative positions contain non-finite values")
+
+    max_rel = float(np.max(np.linalg.norm(used_positions_rel, axis=1)))
+    if max_rel > 100000.0:
+        warn(
+            "maximum antenna distance from HDF5 /array center is unusually large: "
+            f"{max_rel} m"
+        )
 
     return {
         "antenna_ids": used_ids.astype(np.int64),
@@ -459,6 +1163,13 @@ def build_used_antenna_metadata(h5: h5py.File) -> dict[str, Any]:
         "antenna_positions_abs_m": used_positions_abs.astype(np.float64),
         "antenna_positions_rel_m": used_positions_rel.astype(np.float64),
         "array_center_m": array_center.astype(np.float64),
+        "array_name": array_meta["array_name"],
+        "array_config_name": array_meta["array_config_name"],
+        "array_center_longitude_deg": array_meta["array_center_longitude_deg"],
+        "array_center_latitude_deg": array_meta["array_center_latitude_deg"],
+        "array_center_altitude_m": array_meta["array_center_altitude_m"],
+        "array_center_source": array_meta["array_center_source"],
+        "array_position_frame": array_meta["array_position_frame"],
         "dish_diameter_m": used_dish_m.astype(np.float64),
     }
 
@@ -974,6 +1685,32 @@ def build_telescope_location(used_meta: dict[str, Any]) -> Any:
     )
 
 
+def get_used_meta_array_name(used_meta: dict[str, Any]) -> str:
+    """
+    Return the authoritative telescope/array/instrument name.
+
+    In production, this must come from HDF5 /array/name. The default constant is
+    reserved for defensive internal/debug payloads and is not used for normal
+    HDF5 conversion.
+    """
+    array_name = str(used_meta.get("array_name", "")).strip()
+    if array_name != "":
+        return array_name
+
+    raise ValueError(
+        "missing used_meta['array_name']; HDF5 /array/name is required "
+        "as the authoritative telescope/array/instrument name"
+    )
+
+
+def get_payload_array_name(payload: dict[str, Any]) -> str:
+    return get_used_meta_array_name(payload.get("used_meta", {}))
+
+
+def get_payload_instrument_name(payload: dict[str, Any]) -> str:
+    return get_payload_array_name(payload)
+
+
 def filter_uvdata_new_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     """
     Keep only keyword arguments supported by the installed pyuvdata UVData.new().
@@ -1042,6 +1779,17 @@ def validate_payload_before_uvdata(payload: dict[str, Any]) -> None:
     if payload["channel_width_hz"].shape != (nfreqs,):
         raise ValueError("payload channel_width_hz length mismatch")
 
+    for path in [
+        "field_id_array",
+        "phase_center_id_array",
+        "state_id_array",
+        "scan_number_array",
+        "observation_id_array",
+        "data_desc_id_array",
+    ]:
+        if path in payload and payload[path].shape != (nblts,):
+            raise ValueError(f"payload {path} length mismatch")
+
     if not np.all(np.diff(payload["time_array_jd"]) >= 0):
         warn("time_array_jd is not monotonically increasing")
 
@@ -1072,6 +1820,75 @@ def validate_payload_before_uvdata(payload: dict[str, Any]) -> None:
     if np.any((payload["nsample_array"] == 0) & (~payload["flag_array"])):
         raise ValueError("payload has unflagged data with zero nsample")
 
+    used_meta = payload["used_meta"]
+    antenna_positions_abs = np.asarray(
+        used_meta["antenna_positions_abs_m"],
+        dtype=np.float64,
+    )
+    antenna_positions_rel = np.asarray(
+        used_meta["antenna_positions_rel_m"],
+        dtype=np.float64,
+    )
+    array_center = np.asarray(used_meta["array_center_m"], dtype=np.float64)
+
+    if array_center.shape != (3,):
+        raise ValueError("payload array_center_m shape mismatch")
+
+    if antenna_positions_abs.shape != antenna_positions_rel.shape:
+        raise ValueError("payload antenna abs/rel position shape mismatch")
+
+    if antenna_positions_abs.ndim != 2 or antenna_positions_abs.shape[1] != 3:
+        raise ValueError("payload antenna position arrays must have shape (Nant, 3)")
+
+    if not np.all(np.isfinite(array_center)):
+        raise ValueError("payload array_center_m contains non-finite values")
+
+    if not np.all(np.isfinite(antenna_positions_abs)):
+        raise ValueError("payload absolute antenna positions contain non-finite values")
+
+    if not np.all(np.isfinite(antenna_positions_rel)):
+        raise ValueError("payload relative antenna positions contain non-finite values")
+
+    expected_rel = antenna_positions_abs - array_center
+    if not np.allclose(antenna_positions_rel, expected_rel, rtol=0.0, atol=1e-6):
+        raise ValueError(
+            "payload relative antenna positions do not equal "
+            "absolute positions minus HDF5 /array center"
+        )
+
+    array_name = get_used_meta_array_name(used_meta)
+    array_config_name = str(used_meta.get("array_config_name", array_name)).strip()
+    if array_name == CARRY_PHASE1_NAME or array_config_name == CARRY_PHASE1_NAME:
+        antenna_ids = np.asarray(used_meta["antenna_ids"], dtype=np.int64)
+        if not np.array_equal(antenna_ids, CARRY_PHASE1_ANTENNA_IDS):
+            raise ValueError(
+                "CARRY_PHASE1 payload must contain exactly used antennas "
+                f"[0,1,2,3]; got {antenna_ids.tolist()}"
+            )
+        if antenna_positions_abs.shape != (CARRY_PHASE1_ANTENNA_IDS.size, 3):
+            raise ValueError(
+                "CARRY_PHASE1 payload antenna positions must have shape (4, 3)"
+            )
+
+    if "phase_center_catalog" in payload and "phase_center_id_array" in payload:
+        catalog_keys = set(
+            int(key) for key in payload["phase_center_catalog"].keys()
+        )
+        used_phase_center_ids = set(
+            int(item)
+            for item in np.unique(
+                np.asarray(payload["phase_center_id_array"], dtype=np.int64)
+            )
+        )
+        missing_phase_center_ids = sorted(used_phase_center_ids - catalog_keys)
+
+        if missing_phase_center_ids:
+            raise ValueError(
+                "payload phase_center_id_array contains ids missing from "
+                "phase_center_catalog: "
+                f"{missing_phase_center_ids}; catalog keys={sorted(catalog_keys)}"
+            )
+
 
 def baseline_to_array(
     uvd: Any,
@@ -1094,9 +1911,10 @@ def build_telescope_object(
     if Telescope is None:
         raise RuntimeError("pyuvdata Telescope class is unavailable")
 
+    array_name = get_used_meta_array_name(used_meta)
     tel = Telescope()
-    tel.name = CASA_TELESCOPE_NAME
-    tel.instrument = INSTRUMENT_NAME
+    tel.name = array_name
+    tel.instrument = array_name
     tel.location = build_telescope_location(used_meta)
     tel.antenna_positions = used_meta["antenna_positions_rel_m"]
     tel.antenna_names = used_meta["antenna_names"]
@@ -1106,6 +1924,54 @@ def build_telescope_object(
         tel.x_orientation = x_orientation
 
     return tel
+
+
+def apply_phase_center_metadata(
+    uvd: Any,
+    phase_center_catalog: dict[int, dict[str, Any]],
+    phase_center_id_array: np.ndarray,
+) -> None:
+    """
+    Apply multi-field phase-center metadata after UVData.new().
+
+    pyuvdata 2.4.x may validate a default single-entry phase_center_catalog
+    during UVData.new(). For combined cal+target data, phase_center_id_array can
+    contain more than one FIELD/phase-center id. Applying the complete catalog
+    after construction avoids mismatching a multi-valued phase_center_id_array
+    against a temporary default catalog with only key 0.
+    """
+    phase_center_id_array = np.asarray(phase_center_id_array, dtype=np.int64)
+    catalog_keys = set(int(key) for key in phase_center_catalog.keys())
+    used_phase_center_ids = set(
+        int(item) for item in np.unique(phase_center_id_array)
+    )
+    missing_phase_center_ids = sorted(used_phase_center_ids - catalog_keys)
+
+    if missing_phase_center_ids:
+        raise ValueError(
+            "phase_center_id_array contains ids missing from "
+            "phase_center_catalog: "
+            f"{missing_phase_center_ids}; catalog keys={sorted(catalog_keys)}"
+        )
+
+    uvd.phase_center_catalog = phase_center_catalog
+    uvd.phase_center_id_array = phase_center_id_array
+
+
+def refresh_app_coords_after_phase_center(uvd: Any) -> None:
+    """
+    Refresh pyuvdata apparent-coordinate metadata after replacing the phase center.
+
+    Some pyuvdata 2.4.x constructors create default phase-center metadata inside
+    UVData.new().  For this exporter, the complete FIELD/phase-center catalog is
+    applied after construction, so any cached/app-coordinate metadata should be
+    refreshed before we attach the HDF5 UVW and call uvd.check().
+    """
+    if hasattr(uvd, "_set_app_coords_helper"):
+        try:
+            uvd._set_app_coords_helper()
+        except Exception as error:  # pragma: no cover
+            warn(f"_set_app_coords_helper failed after phase center update: {error}")
 
 
 def apply_uvdata_payload_arrays(
@@ -1119,11 +1985,21 @@ def apply_uvdata_payload_arrays(
     uvd.nsample_array = ms_payload["nsample_array"]
     uvd.integration_time = ms_payload["integration_time_array_s"]
     uvd.channel_width = ms_payload["channel_width_hz"]
-    uvd.uvw_array = ms_payload["uvw_array_m"]
     uvd.vis_units = "uncalib"
     uvd.history = ms_payload["history"]
-    uvd.phase_center_catalog = phase_center_catalog
-    uvd.phase_center_id_array = phase_center_id_array
+
+    # Apply the complete FIELD/phase-center metadata before attaching HDF5 UVW.
+    # This avoids checking HDF5 UVW against a temporary/default phase center.
+    apply_phase_center_metadata(
+        uvd,
+        phase_center_catalog=phase_center_catalog,
+        phase_center_id_array=phase_center_id_array,
+    )
+    refresh_app_coords_after_phase_center(uvd)
+    uvd.uvw_array = np.asarray(ms_payload["uvw_array_m"], dtype=np.float64)
+
+    if "scan_number_array" in ms_payload:
+        uvd.scan_number_array = ms_payload["scan_number_array"]
 
 
 def normalize_uvdata_writer_metadata(uvd: Any, ms_payload: dict[str, Any]) -> None:
@@ -1159,8 +2035,9 @@ def normalize_uvdata_writer_metadata(uvd: Any, ms_payload: dict[str, Any]) -> No
             dtype=np.float64,
         )
 
-    uvd.telescope_name = CASA_TELESCOPE_NAME
-    uvd.instrument = INSTRUMENT_NAME
+    array_name = get_used_meta_array_name(used_meta)
+    uvd.telescope_name = array_name
+    uvd.instrument = array_name
 
 
 def build_uvdata_with_explicit_new(ms_payload: dict[str, Any]) -> Any:
@@ -1170,8 +2047,17 @@ def build_uvdata_with_explicit_new(ms_payload: dict[str, Any]) -> Any:
         raise RuntimeError("this pyuvdata version does not provide UVData.new()")
 
     used_meta = ms_payload["used_meta"]
-    phase_center_catalog = build_phase_center_catalog(ms_payload["h5"])
-    phase_center_id_array = np.zeros(ms_payload["Nblts"], dtype=np.int64)
+    array_name = get_used_meta_array_name(used_meta)
+    phase_center_catalog = ms_payload.get("phase_center_catalog")
+    if phase_center_catalog is None:
+        phase_center_catalog = build_phase_center_catalog(ms_payload["h5"])
+    phase_center_id_array = np.asarray(
+        ms_payload.get(
+            "phase_center_id_array",
+            np.zeros(ms_payload["Nblts"], dtype=np.int64),
+        ),
+        dtype=np.int64,
+    )
     antpairs = np.column_stack(
         [ms_payload["ant_1_array"], ms_payload["ant_2_array"]]
     ).astype(np.int64)
@@ -1187,7 +2073,7 @@ def build_uvdata_with_explicit_new(ms_payload: dict[str, Any]) -> Any:
         "polarization_array": POL_NUMS.astype(np.int64),
         "antenna_positions": used_meta["antenna_positions_rel_m"].astype(np.float64),
         "telescope_location": build_telescope_location(used_meta),
-        "telescope_name": CASA_TELESCOPE_NAME,
+        "telescope_name": array_name,
         "times": ms_payload["time_array_jd"].astype(np.float64),
     }
 
@@ -1202,17 +2088,31 @@ def build_uvdata_with_explicit_new(ms_payload: dict[str, Any]) -> Any:
         "channel_width": ms_payload["channel_width_hz"].astype(np.float64),
         "antenna_names": used_meta["antenna_names"].tolist(),
         "antenna_numbers": used_meta["antenna_ids"].astype(np.int64).tolist(),
-        "instrument": INSTRUMENT_NAME,
+        "instrument": array_name,
         "vis_units": "uncalib",
         "history": ms_payload["history"],
-        "phase_center_catalog": phase_center_catalog,
-        "phase_center_id_array": phase_center_id_array,
         "x_orientation": x_orientation,
-        "uvw_array": ms_payload["uvw_array_m"].astype(np.float64),
+        # Do not pass uvw_array into UVData.new().  In pyuvdata 2.4.x, the
+        # constructor may validate UVW before this exporter has applied the
+        # complete FIELD/phase-center catalog.  Attach HDF5 UVW only after
+        # apply_phase_center_metadata().
     }
 
     try:
         uvd = UVData.new(**filter_uvdata_new_kwargs(full_kwargs))
+
+        # Apply the real phase-center catalog first, then attach HDF5 UVW.
+        # The UVW warning we are debugging is sensitive to this ordering.
+        apply_phase_center_metadata(
+            uvd,
+            phase_center_catalog=phase_center_catalog,
+            phase_center_id_array=phase_center_id_array,
+        )
+        refresh_app_coords_after_phase_center(uvd)
+        uvd.uvw_array = ms_payload["uvw_array_m"].astype(np.float64)
+
+        if "scan_number_array" in ms_payload:
+            uvd.scan_number_array = ms_payload["scan_number_array"]
         normalize_uvdata_writer_metadata(uvd, ms_payload)
         return uvd
     except TypeError as error:
@@ -1226,9 +2126,7 @@ def build_uvdata_with_explicit_new(ms_payload: dict[str, Any]) -> Any:
         "channel_width": ms_payload["channel_width_hz"].astype(np.float64),
         "antenna_names": used_meta["antenna_names"].tolist(),
         "antenna_numbers": used_meta["antenna_ids"].astype(np.int64).tolist(),
-        "instrument": INSTRUMENT_NAME,
-        "phase_center_catalog": phase_center_catalog,
-        "phase_center_id_array": phase_center_id_array,
+        "instrument": array_name,
         "x_orientation": x_orientation,
     }
 
@@ -1244,8 +2142,16 @@ def build_uvdata_with_explicit_new(ms_payload: dict[str, Any]) -> Any:
 
 
 def build_uvdata_manual(ms_payload: dict[str, Any]) -> Any:
-    phase_center_catalog = build_phase_center_catalog(ms_payload["h5"])
-    phase_center_id_array = np.zeros(ms_payload["Nblts"], dtype=np.int64)
+    phase_center_catalog = ms_payload.get("phase_center_catalog")
+    if phase_center_catalog is None:
+        phase_center_catalog = build_phase_center_catalog(ms_payload["h5"])
+    phase_center_id_array = np.asarray(
+        ms_payload.get(
+            "phase_center_id_array",
+            np.zeros(ms_payload["Nblts"], dtype=np.int64),
+        ),
+        dtype=np.int64,
+    )
 
     uvd = UVData()
     uvd.telescope = build_telescope_object(
@@ -1264,7 +2170,13 @@ def build_uvdata_manual(ms_payload: dict[str, Any]) -> Any:
         phase_center_id_array=phase_center_id_array,
     )
     normalize_uvdata_writer_metadata(uvd, ms_payload)
-    uvd.scan_number_array = np.ones(ms_payload["Nblts"], dtype=np.int64)
+    uvd.scan_number_array = np.asarray(
+        ms_payload.get(
+            "scan_number_array",
+            np.ones(ms_payload["Nblts"], dtype=np.int64),
+        ),
+        dtype=np.int64,
+    )
     uvd.spw_array = np.array([0], dtype=np.int64)
     uvd.flex_spw_id_array = np.zeros(ms_payload["Nfreqs"], dtype=np.int64)
     uvd.baseline_array = baseline_to_array(
@@ -1371,6 +2283,20 @@ def verify_uvdata_payload_consistency(uvd: Any, payload: dict[str, Any]) -> None
     ):
         raise ValueError("UVData polarization_array does not match expected POL_NUMS")
 
+    if "phase_center_id_array" in payload and hasattr(uvd, "phase_center_id_array"):
+        if not np.array_equal(
+            np.asarray(uvd.phase_center_id_array, dtype=np.int64),
+            payload["phase_center_id_array"],
+        ):
+            raise ValueError("UVData phase_center_id_array does not match payload")
+
+    if "scan_number_array" in payload and hasattr(uvd, "scan_number_array"):
+        if not np.array_equal(
+            np.asarray(uvd.scan_number_array, dtype=np.int64),
+            payload["scan_number_array"],
+        ):
+            raise ValueError("UVData scan_number_array does not match payload")
+
     telescope_location = np.asarray(getattr(uvd, "telescope_location"), dtype=np.float64)
     if telescope_location.shape != (3,):
         raise ValueError(
@@ -1449,10 +2375,12 @@ def prepare_ms_payload(
         exposure_sec,
         dtype=np.float64,
     )
+    used_meta = layout["used_meta"]
+    array_name = get_used_meta_array_name(used_meta)
 
     return {
         "h5": h5,
-        "used_meta": layout["used_meta"],
+        "used_meta": used_meta,
         "antpairs": layout["antpairs"],
         "ant_1_array": ant_1_array,
         "ant_2_array": ant_2_array,
@@ -1492,9 +2420,12 @@ def prepare_ms_payload(
         "history": (
             "Created from MS-ready HDF5 by hdf5_to_ms.py via pyuvdata. "
             f"source_hdf5={h5.filename}; "
-            f"array_name={ARRAY_NAME}; "
-            f"instrument_name={INSTRUMENT_NAME}; "
-            f"casa_telescope_name={CASA_TELESCOPE_NAME}; "
+            f"array_name={array_name}; "
+            f"array_config_name={used_meta.get('array_config_name', array_name)}; "
+            f"instrument_name={array_name}; "
+            "telescope_name_source=HDF5 /array/name; "
+            f"array_center_source={used_meta.get('array_center_source', 'unknown')}; "
+            "array_center_source_path=/array/center_itrf_m; "
             f"corr_output_mode={as_text(h5.attrs.get('corr_output_mode', 'unknown'))}; "
             f"polarization_order={','.join(POL_ORDER)}; "
             f"include_autos={include_autos}; "
@@ -1511,16 +2442,335 @@ def prepare_ms_payload(
     }
 
 
-def print_payload_summary(h5: h5py.File, payload: dict[str, Any], include_autos: bool) -> None:
+def combine_used_antenna_metadata(payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    by_ant_id: dict[int, dict[str, Any]] = {}
+    ref_used_meta = payloads[0]["used_meta"]
+    ref_array_name = get_used_meta_array_name(ref_used_meta)
+    ref_array_config_name = str(
+        ref_used_meta.get("array_config_name", ref_array_name)
+    ).strip()
+    ref_array_frame = str(ref_used_meta.get("array_position_frame", "")).strip()
+    ref_center = np.asarray(ref_used_meta["array_center_m"], dtype=np.float64)
+
+    for payload in payloads:
+        used_meta = payload["used_meta"]
+        array_name = get_used_meta_array_name(used_meta)
+        array_config_name = str(
+            used_meta.get("array_config_name", array_name)
+        ).strip()
+        array_frame = str(used_meta.get("array_position_frame", "")).strip()
+
+        if array_name != ref_array_name:
+            raise ValueError("array name mismatch between payloads")
+
+        if array_config_name != ref_array_config_name:
+            raise ValueError("array config name mismatch between payloads")
+
+        if array_frame != ref_array_frame:
+            raise ValueError("array position frame mismatch between payloads")
+
+        if not np.allclose(
+            np.asarray(used_meta["array_center_m"], dtype=np.float64),
+            ref_center,
+            rtol=0.0,
+            atol=1e-6,
+        ):
+            raise ValueError("array center mismatch between payloads")
+
+        ant_ids = np.asarray(used_meta["antenna_ids"], dtype=np.int64)
+
+        for index, ant_id_value in enumerate(ant_ids):
+            ant_id = int(ant_id_value)
+            item = {
+                "name": as_text(used_meta["antenna_names"][index]),
+                "station": as_text(used_meta["station_names"][index]),
+                "position_abs": np.asarray(
+                    used_meta["antenna_positions_abs_m"][index],
+                    dtype=np.float64,
+                ),
+                "dish_m": float(used_meta["dish_diameter_m"][index]),
+            }
+            previous = by_ant_id.get(ant_id)
+
+            if previous is None:
+                by_ant_id[ant_id] = item
+                continue
+
+            if previous["name"] != item["name"]:
+                raise ValueError(f"antenna name mismatch for antenna {ant_id}")
+            if previous["station"] != item["station"]:
+                raise ValueError(f"antenna station mismatch for antenna {ant_id}")
+            if not np.allclose(
+                previous["position_abs"],
+                item["position_abs"],
+                rtol=0.0,
+                atol=1e-6,
+            ):
+                raise ValueError(f"antenna position mismatch for antenna {ant_id}")
+            if abs(previous["dish_m"] - item["dish_m"]) > 1e-6:
+                raise ValueError(f"antenna dish diameter mismatch for antenna {ant_id}")
+
+    antenna_ids = np.array(sorted(by_ant_id), dtype=np.int64)
+    antenna_names = np.array(
+        [by_ant_id[int(ant_id)]["name"] for ant_id in antenna_ids],
+        dtype=object,
+    )
+    station_names = np.array(
+        [by_ant_id[int(ant_id)]["station"] for ant_id in antenna_ids],
+        dtype=object,
+    )
+    antenna_positions_abs = np.vstack(
+        [by_ant_id[int(ant_id)]["position_abs"] for ant_id in antenna_ids]
+    ).astype(np.float64)
+    dish_diameter_m = np.array(
+        [by_ant_id[int(ant_id)]["dish_m"] for ant_id in antenna_ids],
+        dtype=np.float64,
+    )
+    antenna_positions_rel = antenna_positions_abs - ref_center
+
+    return {
+        "antenna_ids": antenna_ids,
+        "antenna_names": antenna_names,
+        "station_names": station_names,
+        "antenna_positions_abs_m": antenna_positions_abs,
+        "antenna_positions_rel_m": antenna_positions_rel.astype(np.float64),
+        "array_center_m": ref_center.astype(np.float64),
+        "array_name": ref_array_name,
+        "array_config_name": ref_array_config_name,
+        "array_center_longitude_deg": ref_used_meta["array_center_longitude_deg"],
+        "array_center_latitude_deg": ref_used_meta["array_center_latitude_deg"],
+        "array_center_altitude_m": ref_used_meta["array_center_altitude_m"],
+        "array_center_source": ref_used_meta["array_center_source"],
+        "array_position_frame": ref_array_frame,
+        "dish_diameter_m": dish_diameter_m,
+    }
+
+
+def sum_payload_counter(
+    payloads: list[dict[str, Any]],
+    key: str,
+    default: int = 0,
+) -> int:
+    return int(sum(int(payload.get(key, default)) for payload in payloads))
+
+
+def sum_pol_count_dicts(payloads: list[dict[str, Any]], key: str) -> dict[str, int]:
+    result = {name: 0 for name in POL_ORDER}
+
+    for payload in payloads:
+        value = payload.get(key, {})
+        for pol_name in POL_ORDER:
+            result[pol_name] += int(value.get(pol_name, 0))
+
+    return result
+
+
+def combine_ms_payloads(
+    infos: list[dict[str, Any]],
+    payloads: list[dict[str, Any]],
+    field_table: list[dict[str, Any]],
+    state_table: list[dict[str, Any]],
+    scan_table: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if len(infos) != len(payloads):
+        raise ValueError("internal error: HDF5 info/payload count mismatch")
+    if len(payloads) == 0:
+        raise ValueError("no payloads to combine")
+
+    first = payloads[0]
+    data_array = np.concatenate([payload["data_array"] for payload in payloads], axis=0)
+    flag_array = np.concatenate([payload["flag_array"] for payload in payloads], axis=0)
+    nsample_array = np.concatenate(
+        [payload["nsample_array"] for payload in payloads],
+        axis=0,
+    )
+    uvw_array_m = np.concatenate(
+        [payload["uvw_array_m"] for payload in payloads],
+        axis=0,
+    )
+    ant_1_array = np.concatenate(
+        [payload["ant_1_array"] for payload in payloads],
+        axis=0,
+    )
+    ant_2_array = np.concatenate(
+        [payload["ant_2_array"] for payload in payloads],
+        axis=0,
+    )
+    time_array_jd = np.concatenate(
+        [payload["time_array_jd"] for payload in payloads],
+        axis=0,
+    )
+    time_index_array = np.concatenate(
+        [payload["time_index_array"] for payload in payloads],
+        axis=0,
+    )
+    integration_time_array_s = np.concatenate(
+        [payload["integration_time_array_s"] for payload in payloads],
+        axis=0,
+    )
+    field_id_array = np.concatenate(
+        [
+            np.full(payload["Nblts"], int(info["field_id"]), dtype=np.int64)
+            for info, payload in zip(infos, payloads)
+        ],
+        axis=0,
+    )
+    state_id_array = np.concatenate(
+        [
+            np.full(payload["Nblts"], int(info["state_id"]), dtype=np.int64)
+            for info, payload in zip(infos, payloads)
+        ],
+        axis=0,
+    )
+    scan_number_array = np.concatenate(
+        [
+            np.full(payload["Nblts"], int(info["scan_number"]), dtype=np.int64)
+            for info, payload in zip(infos, payloads)
+        ],
+        axis=0,
+    )
+    observation_id_array = np.zeros(data_array.shape[0], dtype=np.int64)
+    data_desc_id_array = np.zeros(data_array.shape[0], dtype=np.int64)
+
+    antpairs = np.vstack([payload["antpairs"] for payload in payloads])
+    antpairs = np.unique(antpairs.astype(np.int64), axis=0)
+    used_meta = combine_used_antenna_metadata(payloads)
+    array_name = get_used_meta_array_name(used_meta)
+    phase_center_catalog = build_phase_center_catalog_from_field_table(field_table)
+
+    history = (
+        "Created from one or more MS-ready HDF5 files by hdf5_to_ms.py via "
+        "pyuvdata. "
+        f"source_hdf5={','.join(info['file'] for info in infos)}; "
+        f"array_name={array_name}; "
+        f"array_config_name={used_meta.get('array_config_name', array_name)}; "
+        f"instrument_name={array_name}; "
+        "telescope_name_source=HDF5 /array/name; "
+        f"array_center_source={used_meta.get('array_center_source', 'unknown')}; "
+        "array_center_source_path=/array/center_itrf_m; "
+        f"polarization_order={','.join(POL_ORDER)}; "
+        f"include_autos={first['include_autos']}; "
+        f"auto_data_policy={'preserve_hdf5_data_even_if_zero' if first['include_autos'] else 'not_written'}; "
+        f"allow_partial_pols={first['allow_partial_pols']}; "
+        f"x_orientation={first['x_orientation']}; "
+        "uvw_source=/uvw/uvw_m from each HDF5; "
+        "frequency_axis_output_order=ascending; "
+        "vis_units=uncalib."
+    )
+
+    return {
+        "h5": first["h5"],
+        "source_h5_files": [info["file"] for info in infos],
+        "hdf5_infos": infos,
+        "field_table": field_table,
+        "state_table": state_table,
+        "scan_table": scan_table,
+        "used_meta": used_meta,
+        "antpairs": antpairs,
+        "ant_1_array": ant_1_array,
+        "ant_2_array": ant_2_array,
+        "time_array_jd": time_array_jd,
+        "time_index_array": time_index_array,
+        "uvw_array_m": uvw_array_m,
+        "data_array": data_array,
+        "flag_array": flag_array,
+        "nsample_array": nsample_array,
+        "freq_array_hz": first["freq_array_hz"],
+        "channel_width_hz": first["channel_width_hz"],
+        "frequency_axis_reordered": any(
+            bool(payload["frequency_axis_reordered"]) for payload in payloads
+        ),
+        "frequency_axis_input_order": first["frequency_axis_input_order"],
+        "frequency_axis_output_order": "ascending",
+        "integration_time_array_s": integration_time_array_s,
+        "field_id_array": field_id_array,
+        # Keep a complete multi-FIELD phase-center catalog in the combined payload.
+        # For cal+target exports, phase_center_id_array can contain ids [0, 1, ...].
+        # If this catalog is omitted, build_uvdata_with_explicit_new() falls back to
+        # the first HDF5 file only and creates a single-entry catalog {0: ...},
+        # which causes pyuvdata to fail when phase_center_id_array contains 1.
+        "phase_center_catalog": phase_center_catalog,
+        "phase_center_id_array": field_id_array.copy(),
+        "state_id_array": state_id_array,
+        "scan_number_array": scan_number_array,
+        "observation_id_array": observation_id_array,
+        "data_desc_id_array": data_desc_id_array,
+        "rows_with_any_data": sum_payload_counter(payloads, "rows_with_any_data"),
+        "rows_with_partial_pols": sum_payload_counter(
+            payloads,
+            "rows_with_partial_pols",
+        ),
+        "rows_dropped_all_missing": sum_payload_counter(
+            payloads,
+            "rows_dropped_all_missing",
+        ),
+        "rows_auto_candidate": sum_payload_counter(payloads, "rows_auto_candidate"),
+        "rows_auto_written": sum_payload_counter(payloads, "rows_auto_written"),
+        "rows_auto_dropped_all_missing": sum_payload_counter(
+            payloads,
+            "rows_auto_dropped_all_missing",
+        ),
+        "rows_cross_written": sum_payload_counter(payloads, "rows_cross_written"),
+        "rows_autos_flagged": sum_payload_counter(payloads, "rows_autos_flagged"),
+        "include_autos": first["include_autos"],
+        "allow_partial_pols": first["allow_partial_pols"],
+        "allow_uvw_warnings": first["allow_uvw_warnings"],
+        "x_orientation": first["x_orientation"],
+        "unflagged_by_pol": sum_pol_count_dicts(payloads, "unflagged_by_pol"),
+        "flagged_by_pol": sum_pol_count_dicts(payloads, "flagged_by_pol"),
+        "Nblts": int(data_array.shape[0]),
+        "Nbls": int(
+            np.unique(np.column_stack([ant_1_array, ant_2_array]), axis=0).shape[0]
+        )
+        if ant_1_array.size > 0
+        else 0,
+        "Ntimes": int(np.unique(time_array_jd).size),
+        "Nfreqs": int(first["freq_array_hz"].size),
+        "Npols": int(len(POL_ORDER)),
+        "history": history,
+        "is_multi_hdf5": len(payloads) > 1,
+    }
+
+
+def print_payload_summary(
+    h5: h5py.File | None,
+    payload: dict[str, Any],
+    include_autos: bool,
+) -> None:
+    used_meta = payload["used_meta"]
     print("\n========== HDF5 -> MS SUMMARY ==========")
-    print("input hdf5               :", h5.filename)
-    print("source name              :", read_text_scalar(h5, "field/source_name"))
-    print("CASA telescope name     :", CASA_TELESCOPE_NAME)
-    print("array name              :", ARRAY_NAME)
-    print("instrument name         :", INSTRUMENT_NAME)
-    print("phase center RA HMS      :", read_text_scalar(h5, "field/phase_center_ra_hms"))
-    print("phase center Dec DMS     :", read_text_scalar(h5, "field/phase_center_dec_dms"))
-    print("corr output mode         :", h5.attrs.get("corr_output_mode", "unknown"))
+    print("input hdf5 count         :", len(payload.get("source_h5_files", [])))
+    for index, file_path in enumerate(payload.get("source_h5_files", []), start=1):
+        print(f"input hdf5 {index:02d}          :", file_path)
+
+    if len(payload.get("field_table", [])) == 1:
+        field0 = payload["field_table"][0]
+        print("source name              :", field0["source_name"])
+        print("phase center RA rad      :", field0["phase_center_ra_rad"])
+        print("phase center Dec rad     :", field0["phase_center_dec_rad"])
+    elif h5 is not None:
+        print("source name              :", read_text_scalar(h5, "field/source_name"))
+        print("phase center RA HMS      :", read_text_scalar(h5, "field/phase_center_ra_hms"))
+        print("phase center Dec DMS     :", read_text_scalar(h5, "field/phase_center_dec_dms"))
+    else:
+        print("source name              : multiple")
+
+    print("CASA telescope name     :", get_payload_array_name(payload))
+    print("array name from HDF5    :", used_meta.get("array_name"))
+    print("array config name       :", used_meta.get("array_config_name"))
+    print("array center source     :", used_meta.get("array_center_source"))
+    print("array position frame    :", used_meta.get("array_position_frame"))
+    print("array center ITRF m     :", used_meta.get("array_center_m"))
+    print(
+        "array center lon/lat/alt:",
+        used_meta.get("array_center_longitude_deg"),
+        used_meta.get("array_center_latitude_deg"),
+        used_meta.get("array_center_altitude_m"),
+    )
+    if h5 is not None:
+        print("corr output mode         :", h5.attrs.get("corr_output_mode", "unknown"))
+    else:
+        print("corr output mode         : see source HDF5 attrs")
     print("include autos            :", include_autos)
     print("allow partial pols       :", payload["allow_partial_pols"])
     print("allow uvw warnings       :", payload["allow_uvw_warnings"])
@@ -1605,6 +2855,42 @@ def print_payload_summary(h5: h5py.File, payload: dict[str, Any], include_autos:
     time = payload["time_array_jd"]
     print("time JD first            :", float(time[0]))
     print("time JD last             :", float(time[-1]))
+
+    print("\nFIELD table:")
+    for field in payload.get("field_table", []):
+        print(
+            f"  FIELD {int(field['field_id'])}: "
+            f"{field['source_name']} "
+            f"ra={float(field['phase_center_ra_rad'])} "
+            f"dec={float(field['phase_center_dec_rad'])} "
+            f"frame={field['frame']}"
+        )
+
+    print("STATE table:")
+    for state in payload.get("state_table", []):
+        print(f"  STATE {int(state['state_id'])}: {state['obs_mode']}")
+
+    print("SCAN order:")
+    for scan in payload.get("scan_table", []):
+        print(
+            f"  scan {int(scan['scan_number'])}: "
+            f"field_id={int(scan['field_id'])} "
+            f"state_id={int(scan['state_id'])} "
+            f"role={scan['role_code']} "
+            f"file={scan['file']}"
+        )
+    if "phase_center_catalog" in payload:
+        print(
+            "phase_center_catalog keys:",
+            sorted([int(key) for key in payload["phase_center_catalog"].keys()]),
+        )
+    if "phase_center_id_array" in payload:
+        print(
+            "phase_center_id_array unique:",
+            np.unique(
+                np.asarray(payload["phase_center_id_array"], dtype=np.int64)
+            ).tolist(),
+        )
     print("========================================")
 
 
@@ -1630,6 +2916,8 @@ def verify_ms_directory_layout(output_ms: str) -> None:
         os.path.join(output_ms, "table.dat"),
         os.path.join(output_ms, "ANTENNA"),
         os.path.join(output_ms, "FIELD"),
+        os.path.join(output_ms, "STATE"),
+        os.path.join(output_ms, "OBSERVATION"),
         os.path.join(output_ms, "SPECTRAL_WINDOW"),
         os.path.join(output_ms, "POLARIZATION"),
         os.path.join(output_ms, "DATA_DESCRIPTION"),
@@ -1638,6 +2926,208 @@ def verify_ms_directory_layout(output_ms: str) -> None:
     for path in required_paths:
         if not os.path.exists(path):
             raise ValueError(f"missing expected MeasurementSet path: {path}")
+
+
+def ensure_main_int_column(tb: Any, column_name: str) -> None:
+    if column_name in tb.colnames():
+        return
+
+    if not hasattr(casacore_tables, "makescacoldesc"):
+        raise RuntimeError(
+            f"cannot create missing MAIN column {column_name}: "
+            "casacore.tables.makescacoldesc is unavailable"
+        )
+    if not hasattr(casacore_tables, "maketabdesc"):
+        raise RuntimeError(
+            f"cannot create missing MAIN column {column_name}: "
+            "casacore.tables.maketabdesc is unavailable"
+        )
+
+    column_desc = casacore_tables.makescacoldesc(
+        column_name,
+        0,
+        valuetype="int",
+    )
+    tb.addcols(casacore_tables.maketabdesc(column_desc))
+
+
+def patch_ms_main_row_metadata(output_ms: str, payload: dict[str, Any]) -> None:
+    tb = casacore_tables.table(output_ms, readonly=False)
+    try:
+        nrows = tb.nrows()
+        if nrows != payload["Nblts"]:
+            raise ValueError(f"MAIN row count mismatch before patch: {nrows}")
+
+        int_columns = {
+            "DATA_DESC_ID": payload.get("data_desc_id_array"),
+            "FIELD_ID": payload.get("field_id_array"),
+            "STATE_ID": payload.get("state_id_array"),
+            "SCAN_NUMBER": payload.get("scan_number_array"),
+            "OBSERVATION_ID": payload.get("observation_id_array"),
+        }
+
+        for column_name, values in int_columns.items():
+            if values is None:
+                continue
+            ensure_main_int_column(tb, column_name)
+            tb.putcol(column_name, np.asarray(values, dtype=np.int32))
+    finally:
+        tb.close()
+
+
+def patch_ms_field_table(output_ms: str, payload: dict[str, Any]) -> None:
+    field_table = payload.get("field_table", [])
+    if len(field_table) == 0:
+        return
+
+    field_path = os.path.join(output_ms, "FIELD")
+    tb = casacore_tables.table(field_path, readonly=False)
+    try:
+        if tb.nrows() < len(field_table):
+            tb.addrows(len(field_table) - tb.nrows())
+
+        columns = set(tb.colnames())
+        for field in field_table:
+            row = int(field["field_id"])
+            direction = np.array(
+                [
+                    [float(field["phase_center_ra_rad"])],
+                    [float(field["phase_center_dec_rad"])],
+                ],
+                dtype=np.float64,
+            )
+
+            if "NAME" in columns:
+                tb.putcell("NAME", row, str(field["source_name"]))
+            if "CODE" in columns:
+                tb.putcell("CODE", row, "")
+            if "TIME" in columns:
+                tb.putcell("TIME", row, 0.0)
+            if "NUM_POLY" in columns:
+                tb.putcell("NUM_POLY", row, 0)
+            if "SOURCE_ID" in columns:
+                tb.putcell("SOURCE_ID", row, -1)
+            if "FLAG_ROW" in columns:
+                tb.putcell("FLAG_ROW", row, False)
+
+            for column_name in ["DELAY_DIR", "PHASE_DIR", "REFERENCE_DIR"]:
+                if column_name in columns:
+                    tb.putcell(column_name, row, direction)
+    finally:
+        tb.close()
+
+
+def create_ms_state_table(state_path: str) -> Any:
+    if not hasattr(casacore_tables, "makescacoldesc"):
+        raise RuntimeError(
+            "cannot create STATE table: casacore.tables.makescacoldesc "
+            "is unavailable"
+        )
+    if not hasattr(casacore_tables, "maketabdesc"):
+        raise RuntimeError(
+            "cannot create STATE table: casacore.tables.maketabdesc "
+            "is unavailable"
+        )
+
+    table_desc = casacore_tables.maketabdesc(
+        [
+            casacore_tables.makescacoldesc("SIG", False),
+            casacore_tables.makescacoldesc("REF", False),
+            casacore_tables.makescacoldesc("CAL", 0.0),
+            casacore_tables.makescacoldesc("LOAD", 0.0),
+            casacore_tables.makescacoldesc("SUB_SCAN", 0),
+            casacore_tables.makescacoldesc("OBS_MODE", ""),
+        ]
+    )
+    return casacore_tables.table(
+        state_path,
+        tabledesc=table_desc,
+        nrow=0,
+        readonly=False,
+    )
+
+
+def patch_ms_state_table(output_ms: str, payload: dict[str, Any]) -> None:
+    state_table = payload.get("state_table", [])
+    state_path = os.path.join(output_ms, "STATE")
+
+    if os.path.exists(state_path):
+        tb = casacore_tables.table(state_path, readonly=False)
+    else:
+        tb = create_ms_state_table(state_path)
+
+    try:
+        if tb.nrows() < len(state_table):
+            tb.addrows(len(state_table) - tb.nrows())
+
+        columns = set(tb.colnames())
+        for state in state_table:
+            row = int(state["state_id"])
+            if "SIG" in columns:
+                tb.putcell("SIG", row, False)
+            if "REF" in columns:
+                tb.putcell("REF", row, False)
+            if "CAL" in columns:
+                tb.putcell("CAL", row, 0.0)
+            if "LOAD" in columns:
+                tb.putcell("LOAD", row, 0.0)
+            if "SUB_SCAN" in columns:
+                tb.putcell("SUB_SCAN", row, 0)
+            if "OBS_MODE" in columns:
+                tb.putcell("OBS_MODE", row, str(state["obs_mode"]))
+    finally:
+        tb.close()
+
+
+def set_ms_subtable_keyword(output_ms: str, subtable_name: str) -> None:
+    subtable_path = os.path.join(output_ms, subtable_name)
+    if not os.path.exists(subtable_path):
+        return
+
+    main_tb = casacore_tables.table(output_ms, readonly=False)
+    sub_tb = casacore_tables.table(subtable_path, readonly=True)
+    try:
+        main_tb.putkeyword(subtable_name, sub_tb)
+    except Exception as error:  # pragma: no cover
+        warn(f"could not set MS keyword for {subtable_name}: {error}")
+    finally:
+        sub_tb.close()
+        main_tb.close()
+
+
+def patch_ms_observation_table(output_ms: str, payload: dict[str, Any]) -> None:
+    observation_path = os.path.join(output_ms, "OBSERVATION")
+    if not os.path.exists(observation_path):
+        return
+
+    tb = casacore_tables.table(observation_path, readonly=False)
+    try:
+        if tb.nrows() < 1:
+            tb.addrows(1)
+
+        columns = set(tb.colnames())
+        if "TELESCOPE_NAME" in columns:
+            tb.putcell("TELESCOPE_NAME", 0, get_payload_array_name(payload))
+        if "TIME_RANGE" in columns and payload["time_array_jd"].size > 0:
+            time_seconds = (payload["time_array_jd"] - 2400000.5) * 86400.0
+            tb.putcell(
+                "TIME_RANGE",
+                0,
+                np.array(
+                    [float(np.min(time_seconds)), float(np.max(time_seconds))],
+                    dtype=np.float64,
+                ),
+            )
+    finally:
+        tb.close()
+
+
+def patch_measurement_set_metadata(output_ms: str, payload: dict[str, Any]) -> None:
+    patch_ms_main_row_metadata(output_ms, payload)
+    patch_ms_field_table(output_ms, payload)
+    patch_ms_state_table(output_ms, payload)
+    patch_ms_observation_table(output_ms, payload)
+    set_ms_subtable_keyword(output_ms, "STATE")
 
 
 def verify_ms_with_casacore(output_ms: str, payload: dict[str, Any]) -> None:
@@ -1659,6 +3149,9 @@ def verify_ms_with_casacore(output_ms: str, payload: dict[str, Any]) -> None:
             "ANTENNA2",
             "DATA_DESC_ID",
             "FIELD_ID",
+            "STATE_ID",
+            "SCAN_NUMBER",
+            "OBSERVATION_ID",
             "INTERVAL",
             "EXPOSURE",
             "WEIGHT",
@@ -1688,8 +3181,24 @@ def verify_ms_with_casacore(output_ms: str, payload: dict[str, Any]) -> None:
             raise ValueError(f"MAIN UVW differs from payload: max diff={max_uvw_diff}")
 
         ddid = np.asarray(tb.getcol("DATA_DESC_ID"), dtype=np.int64)
-        if not np.all(ddid == 0):
-            raise ValueError("DATA_DESC_ID should be 0 for this single-spw/single-pol setup")
+        if not np.array_equal(ddid, payload["data_desc_id_array"]):
+            raise ValueError("DATA_DESC_ID does not match payload")
+
+        field_id = np.asarray(tb.getcol("FIELD_ID"), dtype=np.int64)
+        if not np.array_equal(field_id, payload["field_id_array"]):
+            raise ValueError("FIELD_ID does not match payload")
+
+        state_id = np.asarray(tb.getcol("STATE_ID"), dtype=np.int64)
+        if not np.array_equal(state_id, payload["state_id_array"]):
+            raise ValueError("STATE_ID does not match payload")
+
+        scan_number = np.asarray(tb.getcol("SCAN_NUMBER"), dtype=np.int64)
+        if not np.array_equal(scan_number, payload["scan_number_array"]):
+            raise ValueError("SCAN_NUMBER does not match payload")
+
+        observation_id = np.asarray(tb.getcol("OBSERVATION_ID"), dtype=np.int64)
+        if not np.array_equal(observation_id, payload["observation_id_array"]):
+            raise ValueError("OBSERVATION_ID does not match payload")
 
         flag_row = np.asarray(tb.getcol("FLAG_ROW"), dtype=bool)
         if flag_row.shape != (payload["Nblts"],):
@@ -1813,8 +3322,6 @@ def verify_ms_subtables(output_ms: str, payload: dict[str, Any]) -> None:
     nfreqs = payload["Nfreqs"]
     expected_freq = payload["freq_array_hz"]
     expected_chan_width = payload["channel_width_hz"]
-    expected_ra = float(read_scalar(payload["h5"], "field/phase_center_ra_rad"))
-    expected_dec = float(read_scalar(payload["h5"], "field/phase_center_dec_rad"))
 
     spw = casacore_tables.table(
         os.path.join(output_ms, "SPECTRAL_WINDOW"),
@@ -1896,8 +3403,12 @@ def verify_ms_subtables(output_ms: str, payload: dict[str, Any]) -> None:
         readonly=True,
     )
     try:
-        if ant.nrows() < payload["used_meta"]["antenna_ids"].size:
-            raise ValueError("ANTENNA subtable has fewer rows than used antennas")
+        expected_nants = int(payload["used_meta"]["antenna_ids"].size)
+        if ant.nrows() != expected_nants:
+            raise ValueError(
+                "ANTENNA subtable row count mismatch: "
+                f"{ant.nrows()} != {expected_nants}"
+            )
 
         names = [as_text(item) for item in ant.getcol("NAME")]
         pos = np.asarray(ant.getcol("POSITION"), dtype=np.float64)
@@ -1907,9 +3418,45 @@ def verify_ms_subtables(output_ms: str, payload: dict[str, Any]) -> None:
         if np.max(np.abs(pos)) <= 0.0:
             raise ValueError("ANTENNA POSITION is all zero")
 
-        for name in payload["used_meta"]["antenna_names"]:
-            if as_text(name) not in names:
+        name_to_row = {name: row for row, name in enumerate(names)}
+        used_names = payload["used_meta"]["antenna_names"]
+        used_positions_abs = np.asarray(
+            payload["used_meta"]["antenna_positions_abs_m"],
+            dtype=np.float64,
+        )
+
+        for index, name in enumerate(used_names):
+            name_text = as_text(name)
+            row = name_to_row.get(name_text)
+            if row is None:
                 warn(f"used antenna name not found in ANTENNA subtable: {name}")
+                continue
+
+            if not np.allclose(
+                pos[row],
+                used_positions_abs[index],
+                rtol=0.0,
+                atol=1e-6,
+            ):
+                raise ValueError(
+                    "ANTENNA POSITION does not match HDF5 absolute ITRF "
+                    f"for {name_text}"
+                )
+
+        array_name = get_payload_array_name(payload)
+        array_config_name = str(
+            payload["used_meta"].get("array_config_name", array_name)
+        ).strip()
+        if array_name == CARRY_PHASE1_NAME or array_config_name == CARRY_PHASE1_NAME:
+            expected_names = [
+                f"ant{int(antenna_id)}"
+                for antenna_id in CARRY_PHASE1_ANTENNA_IDS
+            ]
+            if sorted(names) != expected_names:
+                raise ValueError(
+                    "CARRY_PHASE1 MS ANTENNA names must be ant0-ant3; "
+                    f"got {names}"
+                )
     finally:
         ant.close()
 
@@ -1918,25 +3465,77 @@ def verify_ms_subtables(output_ms: str, payload: dict[str, Any]) -> None:
         readonly=True,
     )
     try:
-        if field.nrows() < 1:
-            raise ValueError("FIELD has no rows")
+        expected_fields = payload.get("field_table", [])
+        if field.nrows() < len(expected_fields):
+            raise ValueError(
+                f"FIELD row count mismatch: {field.nrows()} < {len(expected_fields)}"
+            )
 
-        phase_dir = np.asarray(field.getcell("PHASE_DIR", 0), dtype=np.float64)
-        flat = phase_dir.reshape(-1)
-        if flat.size < 2:
-            raise ValueError(f"FIELD PHASE_DIR bad shape: {phase_dir.shape}")
+        names = [as_text(item) for item in field.getcol("NAME")]
 
-        ra = float(flat[0])
-        dec = float(flat[1])
+        for expected in expected_fields:
+            row = int(expected["field_id"])
+            phase_dir = np.asarray(field.getcell("PHASE_DIR", row), dtype=np.float64)
+            flat = phase_dir.reshape(-1)
+            if flat.size < 2:
+                raise ValueError(f"FIELD PHASE_DIR bad shape: {phase_dir.shape}")
 
-        if not np.isfinite(ra) or not np.isfinite(dec):
-            raise ValueError("FIELD PHASE_DIR has non-finite RA/Dec")
-        if abs(ra - expected_ra) > 1e-8:
-            raise ValueError(f"FIELD RA mismatch: {ra} != {expected_ra}")
-        if abs(dec - expected_dec) > 1e-8:
-            raise ValueError(f"FIELD Dec mismatch: {dec} != {expected_dec}")
+            ra = float(flat[0])
+            dec = float(flat[1])
+            expected_ra = float(expected["phase_center_ra_rad"])
+            expected_dec = float(expected["phase_center_dec_rad"])
+
+            if row >= len(names) or names[row] != expected["source_name"]:
+                raise ValueError(
+                    f"FIELD NAME mismatch for row {row}: "
+                    f"{names[row] if row < len(names) else '<missing>'} "
+                    f"!= {expected['source_name']}"
+                )
+            if not np.isfinite(ra) or not np.isfinite(dec):
+                raise ValueError("FIELD PHASE_DIR has non-finite RA/Dec")
+            if abs(ra - expected_ra) > 1e-8:
+                raise ValueError(f"FIELD RA mismatch: {ra} != {expected_ra}")
+            if abs(dec - expected_dec) > 1e-8:
+                raise ValueError(f"FIELD Dec mismatch: {dec} != {expected_dec}")
     finally:
         field.close()
+
+    state_path = os.path.join(output_ms, "STATE")
+    state = casacore_tables.table(state_path, readonly=True)
+    try:
+        expected_states = payload.get("state_table", [])
+        if state.nrows() < len(expected_states):
+            raise ValueError(
+                f"STATE row count mismatch: {state.nrows()} < {len(expected_states)}"
+            )
+
+        obs_modes = [as_text(item) for item in state.getcol("OBS_MODE")]
+        for expected in expected_states:
+            row = int(expected["state_id"])
+            if row >= len(obs_modes) or obs_modes[row] != expected["obs_mode"]:
+                raise ValueError(
+                    f"STATE OBS_MODE mismatch for row {row}: "
+                    f"{obs_modes[row] if row < len(obs_modes) else '<missing>'} "
+                    f"!= {expected['obs_mode']}"
+                )
+    finally:
+        state.close()
+
+    observation_path = os.path.join(output_ms, "OBSERVATION")
+    observation = casacore_tables.table(observation_path, readonly=True)
+    try:
+        if observation.nrows() < 1:
+            raise ValueError("OBSERVATION has no rows")
+        if "TELESCOPE_NAME" in observation.colnames():
+            telescope_names = [as_text(item) for item in observation.getcol("TELESCOPE_NAME")]
+            expected_telescope_name = get_payload_array_name(payload)
+            if telescope_names[0] != expected_telescope_name:
+                raise ValueError(
+                    f"OBSERVATION TELESCOPE_NAME mismatch: "
+                    f"{telescope_names[0]} != {expected_telescope_name}"
+                )
+    finally:
+        observation.close()
 
     print("\n========== MS SUBTABLE CHECK ==========")
     print("SPECTRAL_WINDOW : OK")
@@ -1944,6 +3543,8 @@ def verify_ms_subtables(output_ms: str, payload: dict[str, Any]) -> None:
     print("DATA_DESCRIPTION: OK")
     print("ANTENNA         : OK")
     print("FIELD           : OK")
+    print("STATE           : OK")
+    print("OBSERVATION     : OK")
     print("=======================================")
 
 
@@ -1955,6 +3556,15 @@ def write_measurement_set(
 ) -> None:
     require_pyuvdata()
     require_casacore()
+
+    output_parent = os.path.dirname(os.path.abspath(output_ms))
+    if output_parent != "":
+        if os.path.exists(output_parent) and not os.path.isdir(output_parent):
+            raise NotADirectoryError(
+                f"output parent path is not a directory: {output_parent}"
+            )
+        os.makedirs(output_parent, exist_ok=True)
+
     if os.path.exists(output_ms) and not overwrite:
         raise FileExistsError(
             f"output MeasurementSet already exists: {output_ms}. "
@@ -1966,6 +3576,7 @@ def write_measurement_set(
 
     try:
         uvd.write_ms(output_ms, clobber=overwrite)
+        patch_measurement_set_metadata(output_ms, payload)
         verify_ms_directory_layout(output_ms)
         verify_ms_with_casacore(output_ms, payload)
         verify_ms_subtables(output_ms, payload)
@@ -1985,18 +3596,25 @@ def write_measurement_set(
 def parse_command_line(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert an MS-ready HDF5 file into a CASA MeasurementSet. "
+            "Convert one or more MS-ready HDF5 files into a CASA MeasurementSet. "
             "Default behavior: overwrite output, include auto-correlations, "
             "allow partial polarizations, and use UVData.new."
         )
     )
     parser.add_argument(
-        "input_h5",
-        help="input HDF5 produced by test_with_antenna_uvw.py",
+        "paths",
+        nargs="+",
+        help=(
+            "input HDF5 file(s). Without --output-ms, the final positional "
+            "argument is treated as output_ms for backward compatibility."
+        ),
     )
     parser.add_argument(
-        "output_ms",
-        help="output MeasurementSet directory",
+        "-o",
+        "--output-ms",
+        dest="output_ms",
+        default=None,
+        help="output MeasurementSet directory for one or more input HDF5 files",
     )
     parser.add_argument(
         "--allow-uvw-warnings",
@@ -2034,16 +3652,34 @@ def parse_command_line(argv: list[str]) -> argparse.Namespace:
             "This exits before writing a MeasurementSet."
         ),
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+
+    if args.output_ms is None:
+        if len(args.paths) < 2:
+            parser.error(
+                "expected input_h5 output_ms, or -o/--output-ms output.ms input_h5..."
+            )
+        args.input_h5 = args.paths[:-1]
+        args.output_ms = args.paths[-1]
+    else:
+        args.input_h5 = args.paths
+
+    if len(args.input_h5) == 0:
+        parser.error("at least one input HDF5 file is required")
+
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_command_line(sys.argv[1:] if argv is None else argv)
     print_runtime_versions()
+    if IERS_LOAD_ERROR is not None:
+        warn(f"IERS file unavailable, using astropy fallback table: {IERS_LOAD_ERROR}")
     require_h5py()
 
-    if not os.path.isfile(args.input_h5):
-        raise FileNotFoundError(args.input_h5)
+    for input_h5 in args.input_h5:
+        if not os.path.isfile(input_h5):
+            raise FileNotFoundError(input_h5)
 
     # Production defaults:
     #   - Always overwrite old MS output.
@@ -2055,22 +3691,73 @@ def main(argv: list[str] | None = None) -> int:
     overwrite = True
     uvdata_constructor = "new"
 
-    with h5py.File(args.input_h5, "r") as h5:
-        validate_hdf5_input(h5)
-        estimate_and_check_memory(
-            h5,
-            include_autos=include_autos,
-            max_memory_gb=args.max_memory_gb,
+    infos = [load_hdf5_metadata(input_h5) for input_h5 in args.input_h5]
+    sorted_infos = sort_hdf5_inputs(infos)
+    validate_multi_hdf5_compatibility(sorted_infos)
+    field_table = build_global_field_table(sorted_infos)
+    state_table = build_global_state_table(sorted_infos)
+    scan_table = assign_scan_numbers(sorted_infos)
+    print_hdf5_input_order(sorted_infos)
+
+    with ExitStack() as stack:
+        h5_files = [
+            stack.enter_context(h5py.File(info["file"], "r"))
+            for info in sorted_infos
+        ]
+
+        estimates = []
+        for info, h5 in zip(sorted_infos, h5_files):
+            validate_hdf5_input(h5)
+            estimate = estimate_packed_array_memory(
+                h5,
+                include_autos=include_autos,
+            )
+            estimates.append(estimate)
+            print(
+                "\n[INPUT ESTIMATE]",
+                info["file"],
+                "Nblts:",
+                estimate["nblts"],
+                "total:",
+                format_bytes(int(estimate["total_bytes"])),
+            )
+
+        total_estimated_bytes = int(
+            sum(int(estimate["total_bytes"]) for estimate in estimates)
         )
-        payload = prepare_ms_payload(
-            h5,
-            include_autos=include_autos,
-            allow_partial_pols=allow_partial_pols,
-            allow_uvw_warnings=args.allow_uvw_warnings,
-            x_orientation=args.x_orientation,
+        max_bytes = int(args.max_memory_gb * 1024 ** 3)
+        print("\n========== COMBINED MEMORY ESTIMATE ==========")
+        print("input HDF5 count       :", len(h5_files))
+        print("total approx bytes     :", format_bytes(total_estimated_bytes))
+        print("max memory allowed     :", f"{args.max_memory_gb:.3f} GiB")
+        print("==============================================")
+
+        if total_estimated_bytes > max_bytes:
+            raise MemoryError(
+                "estimated combined packed arrays exceed --max-memory-gb: "
+                f"{format_bytes(total_estimated_bytes)} > "
+                f"{args.max_memory_gb:.3f} GiB"
+            )
+
+        payloads = [
+            prepare_ms_payload(
+                h5,
+                include_autos=include_autos,
+                allow_partial_pols=allow_partial_pols,
+                allow_uvw_warnings=args.allow_uvw_warnings,
+                x_orientation=args.x_orientation,
+            )
+            for h5 in h5_files
+        ]
+        payload = combine_ms_payloads(
+            sorted_infos,
+            payloads,
+            field_table,
+            state_table,
+            scan_table,
         )
         validate_payload_before_uvdata(payload)
-        print_payload_summary(h5, payload, include_autos=include_autos)
+        print_payload_summary(payload["h5"], payload, include_autos=include_autos)
 
         if args.validate_only:
             print("\n[VALIDATE-ONLY] HDF5 schema and payload validation passed.")
